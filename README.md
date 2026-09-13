@@ -1,28 +1,37 @@
 # Enterprise RAG Evaluation Platform
 
-Production-oriented Retrieval-Augmented Generation workbench for **PDF upload, document indexing, hybrid retrieval, grounded Q&A, citations, and reproducible retrieval benchmarks**.
+Production-oriented Retrieval-Augmented Generation workbench for **dynamic PDF ingestion, hybrid retrieval, grounded concise Q&A, abstention, citations, evaluation, and reproducible retrieval benchmarks**.
 
 ## What it does
 
 ```text
 PDF upload
    ↓
-PyPDF extraction
+page-aware extraction + text cleanup
    ↓
-page-aware chunking
-   ↓
-SQLite document/index store
+overlapping chunks + SQLite index
    ↓
 BM25 + TF-IDF hybrid retrieval
    ↓
-source/page citations
+answerability / evidence gate
    ↓
-LLM generation (optional) / extractive fallback
+answer-focused sentence selection or optional LLM
    ↓
-offline answer-quality evaluation
+concise answer + deduplicated page citations
+   ↓
+offline quality evaluation + benchmark
 ```
 
 The corpus is **not hard-coded**. Users upload their own PDFs through the web UI or `POST /api/documents/upload`.
+
+## Key quality safeguards
+
+- **Grounded answerability gate:** unsupported questions abstain instead of returning the highest-scoring unrelated chunk.
+- **Answer-focused extraction:** definition and explanatory sentences are preferred over table-like numeric text.
+- **Noise suppression:** computation-time/memory/table-heavy sentences are down-ranked for normal Q&A.
+- **Concise answers:** the deterministic fallback returns at most two high-quality evidence sentences.
+- **Citation deduplication:** the user-facing UI shows at most three distinct source/page groups.
+- **Advanced retrieval data remains available:** `/api/retrieve` and the API payload still expose retrieval details for evaluation.
 
 ## Features
 
@@ -31,13 +40,14 @@ The corpus is **not hard-coded**. Users upload their own PDFs through the web UI
 - Document registry and local SQLite index
 - Hybrid BM25 + TF-IDF retrieval
 - Retrieval inspection with component scores
-- Q&A restricted to retrieved evidence
-- Source and page citations in the answer payload
-- Optional OpenAI-compatible LLM endpoint via environment variables
+- Grounded Q&A restricted to retrieved evidence
+- Safe abstention for unsupported questions
+- Source and page citations
+- Optional OpenAI-compatible LLM endpoint
 - Deterministic extractive fallback when no LLM key is configured
 - Offline groundedness, answer-relevance and reference-overlap evaluation
 - Benchmark harness for Recall@K, Hit@K, MRR, nDCG@K and latency
-- Dockerized deployment and CI tests
+- Dockerized deployment and regression tests
 
 ## Run locally
 
@@ -77,6 +87,8 @@ Open `http://127.0.0.1:8000`.
 }
 ```
 
+The response includes `answerable`, `evidence_coverage`, `mode`, `citations`, and the retrieved evidence.
+
 ### Evaluate
 
 `POST /api/evaluate`
@@ -113,10 +125,10 @@ python benchmark/benchmark.py
 
 It produces JSON and Markdown reports with retrieval quality and latency. Use the generated measurements—not invented numbers—in a resume, portfolio, or project write-up.
 
+## Regression coverage
+
+`tests/test_answer_quality.py` covers the failure mode found during manual testing: a question such as **“What is QIS?”** must prefer the explanatory definition instead of a noisy scoring table, while an unsupported question such as **“What email addresses are used?”** must abstain.
+
 ## Deployment
 
-The project is containerized for Railway/Render/any Docker host. For production persistence, mount `/app/data` (or set `DATA_DIR`) to a persistent volume; the demo deployment can also run with ephemeral storage.
-
-## Research basis
-
-The architecture follows patterns used in public production-oriented RAG projects: hybrid lexical+dense retrieval, reranking/traceability, PDF ingestion, and explicit retrieval evaluation. The benchmark layer uses standard retrieval metrics such as Hit@K, Recall@K, MRR and nDCG.
+The project is containerized for Railway/Render/any Docker host. For production persistence, mount `/app/data` (or set `DATA_DIR`) to a persistent volume; ephemeral storage is suitable for demos only.

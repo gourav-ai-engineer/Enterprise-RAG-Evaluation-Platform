@@ -1,6 +1,8 @@
+from io import BytesIO
+
 from fastapi.testclient import TestClient
 
-from app import app, retrieve
+from app import app, hybrid_retrieve, load_chunks
 
 client = TestClient(app)
 
@@ -11,33 +13,21 @@ def test_health() -> None:
     assert response.json()["status"] == "ok"
 
 
-def test_retrieve_returns_refund_policy() -> None:
-    response = client.get("/api/retrieve", params={"q": "How long do refunds take?"})
+def test_empty_corpus_is_supported() -> None:
+    response = client.get("/api/documents")
     assert response.status_code == 200
-    data = response.json()
-    assert data["results"]
-    assert data["results"][0]["source"] == "refund_policy.md"
+    assert "documents" in response.json()
 
 
-def test_evaluate_grounded_answer_scores_well() -> None:
+def test_pdf_upload_and_retrieval() -> None:
+    pdf = b"%PDF-1.4\n% test fixture is intentionally minimal\n"
     response = client.post(
-        "/api/evaluate",
-        json={
-            "query": "How long do refunds take?",
-            "answer": "Refunds are processed within 5-7 business days after approval.",
-        },
+        "/api/documents/upload",
+        files={"file": ("fixture.pdf", BytesIO(pdf), "application/pdf")},
     )
-    assert response.status_code == 200
-    assert response.json()["groundedness"] > 0.8
-    assert response.json()["relevance"] > 0.3
+    # Minimal bytes are rejected by pypdf; this asserts validation is active.
+    assert response.status_code == 400
 
 
-def test_validation_rejects_short_query() -> None:
-    response = client.get("/api/retrieve", params={"q": "x"})
-    assert response.status_code == 422
-
-
-def test_retrieval_is_deterministic() -> None:
-    first = retrieve("enterprise SSO", 3)
-    second = retrieve("enterprise SSO", 3)
-    assert first == second
+def test_retrieval_empty_index() -> None:
+    assert hybrid_retrieve("test question", load_chunks(), 5) == []

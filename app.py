@@ -1,97 +1,382 @@
 from __future__ import annotations
 
 import math
+import os
 import re
-from dataclasses import dataclass
-from statistics import mean
+import sqlite3
+import uuid
+from collections import Counter
+from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+import httpx
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
+from pypdf import PdfReader
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
-app = FastAPI(title="Enterprise RAG Evaluation Platform", version="1.0.0")
+APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.getenv("DATA_DIR", APP_DIR / "data"))
+UPLOAD_DIR = DATA_DIR / "documents"
+DB_PATH = DATA_DIR / "rag.db"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(
+    title="Enterprise RAG Evaluation Platform",
+    version="2.0.0",
+    description="Dynamic PDF ingestion, hybrid retrieval, citations and offline evaluation.",
+)
+
+TOKEN_RE = re.compile(r"[a-zA-Z0-9_]+")
+MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "25"))
+CHUNK_WORDS = int(os.getenv("CHUNK_WORDS", "180"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "40"))
 
 
-@dataclass
-class Chunk:
-    id: str
-    text: str
-    source: str
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS documents(
+            id TEXT PRIMARY KEY,
+            filename TEXT NOT NULL,
+            stored_path TEXT NOT NULL,
+            pages INTEGER NOT NULL,
+            chunks INTEGER NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chunks(
+            id TEXT PRIMARY KEY,
+            document_id TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            page_start INTEGER NOT NULL,
+            page_end INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            FOREIGN KEY(document_id) REFERENCES documents(id)
+        )
+    """)
+    conn.commit()
+    return conn
 
 
-CORPUS = [
-    Chunk("c1", "Refunds are processed within 5-7 business days after approval.", "refund_policy.md"),
-    Chunk("c2", "Enterprise plans include SSO, audit logs, and role based access control.", "enterprise.md"),
-    Chunk("c3", "API rate limits are 100 requests per minute for standard tenants.", "api_limits.md"),
-    Chunk("c4", "Critical incidents should be escalated to the on-call engineer immediately.", "incident_response.md"),
-]
+def tokens(text: str) -> list[str]:
+    return [t.lower() for t in TOKEN_RE.findall(text)]
 
 
-def tokenize(text: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9]+", text.lower()))
+def chunk_pages(pages: list[str]) -> list[tuple[int, int, str]]:
+    chunks: list[tuple[int, int, str]] = []
+    current: list[str] = []
+    start_page = 1
+    current_words = 0
+    for page_no, page_text in enumerate(pages, start=1):
+        words = page_text.split()
+        while words:
+            remaining = CHUNK_WORDS - current_words
+            take = max(1, min(remaining, len(words)))
+            current.extend(words[:take])
+            words = words[take:]
+            current_words += take
+            if current_words >= CHUNK_WORDS:
+                chunks.append((start_page, page_no, " ".join(current)))
+                overlap = current[-CHUNK_OVERLAP:] if CHUNK_OVERLAP else []
+                current = overlap
+                current_words = len(current)
+                start_page = page_no
+    if current:
+        chunks.append((start_page, len(pages), " ".join(current)))
+    return chunks
 
 
-def retrieve(query: str, k: int = 3) -> list[Chunk]:
-    q = tokenize(query)
+def load_chunks(document_id: str | None = None) -> list[sqlite3.Row]:
+    conn = db()
+    if document_id:
+        rows = conn.execute("SELECT * FROM chunks WHERE document_id=?", (document_id,)).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM chunks ORDER BY rowid").fetchall()
+    conn.close()
+    return rows
+
+
+def bm25_scores(query: str, docs: list[str]) -> list[float]:
+    q = tokens(query)
+    if not docs or not q:
+        return [0.0] * len(docs)
+    term_df = Counter()
+    frequencies = []
+    lengths = []
+    for doc in docs:
+        tf = Counter(tokens(doc))
+        frequencies.append(tf)
+        lengths.append(sum(tf.values()))
+        term_df.update(tf.keys())
+    avgdl = sum(lengths) / max(1, len(lengths))
+    n = len(docs)
+    k1, b = 1.5, 0.75
+    out = []
+    for tf, dl in zip(frequencies, lengths):
+        score = 0.0
+        for term in q:
+            if term not in tf:
+                continue
+            df = term_df[term]
+            idf = math.log(1 + (n - df + 0.5) / (df + 0.5))
+            score += idf * ((tf[term] * (k1 + 1)) / (tf[term] + k1 * (1 - b + b * dl / max(1, avgdl))))
+        out.append(score)
+    return out
+
+
+def hybrid_retrieve(query: str, rows: list[sqlite3.Row], k: int) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    texts = [row["text"] for row in rows]
+    lexical = bm25_scores(query, texts)
+    vectorizer = TfidfVectorizer(lowercase=True, ngram_range=(1, 2), min_df=1)
+    matrix = vectorizer.fit_transform(texts)
+    qvec = vectorizer.transform([query])
+    dense = cosine_similarity(qvec, matrix)[0].tolist()
+
+    def normalize(values: list[float]) -> list[float]:
+        mx = max(values) if values else 0.0
+        return [v / mx if mx else 0.0 for v in values]
+
+    lex_n = normalize(lexical)
+    dense_n = normalize(dense)
     scored = []
-    for c in CORPUS:
-        t = tokenize(c.text)
-        score = len(q & t) / max(1, math.sqrt(len(q) * len(t)))
-        scored.append((score, c))
-    return [c for _, c in sorted(scored, reverse=True, key=lambda x: x[0])[:k]]
+    for row, b, d in zip(rows, lex_n, dense_n):
+        score = 0.5 * b + 0.5 * d
+        scored.append((score, row, b, d))
+    scored.sort(key=lambda x: (-x[0], x[1]["id"]))
+    return [
+        {
+            "chunk_id": row["id"],
+            "document_id": row["document_id"],
+            "filename": row["filename"],
+            "page_start": row["page_start"],
+            "page_end": row["page_end"],
+            "score": round(score, 4),
+            "bm25": round(b, 4),
+            "tfidf": round(d, 4),
+            "text": row["text"],
+        }
+        for score, row, b, d in scored[:k]
+    ]
 
 
-class EvalRequest(BaseModel):
-    query: str = Field(min_length=3)
-    answer: str = Field(min_length=1)
-    expected: str | None = None
+class AskRequest(BaseModel):
+    question: str = Field(min_length=3, max_length=2000)
+    document_id: str | None = None
+    top_k: int = Field(default=5, ge=1, le=10)
+
+
+class EvaluateRequest(BaseModel):
+    question: str = Field(min_length=3, max_length=2000)
+    answer: str = Field(min_length=1, max_length=10000)
+    document_id: str | None = None
+    reference_answer: str | None = Field(default=None, max_length=10000)
+    top_k: int = Field(default=5, ge=1, le=10)
+
+
+def extractive_answer(question: str, results: list[dict[str, Any]]) -> str:
+    if not results:
+        return "I could not find relevant evidence in the indexed documents."
+    sentences: list[str] = []
+    qset = set(tokens(question))
+    for result in results:
+        for sentence in re.split(r"(?<=[.!?])\s+", result["text"]):
+            overlap = len(qset & set(tokens(sentence)))
+            if overlap:
+                sentences.append((overlap, sentence.strip()))
+    best = [s for _, s in sorted(sentences, key=lambda x: -x[0])[:4]]
+    if not best:
+        best = [results[0]["text"]]
+    return " ".join(best)
+
+
+def llm_answer(question: str, results: list[dict[str, Any]]) -> tuple[str, str]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return extractive_answer(question, results), "extractive"
+    base = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+    context = "\n\n".join(
+        f"[Source {i}] {r['filename']} pages {r['page_start']}-{r['page_end']}\n{r['text']}"
+        for i, r in enumerate(results, start=1)
+    )
+    prompt = (
+        "Answer only from the supplied context. Cite claims using [Source N]. "
+        "If the context does not contain the answer, say you cannot find it.\n\n"
+        f"Question: {question}\n\nContext:\n{context}"
+    )
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a grounded enterprise RAG assistant."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0,
+    }
+    try:
+        response = httpx.post(
+            f"{base}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=payload,
+            timeout=60,
+        )
+        response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"]
+        return content, "llm"
+    except Exception:
+        return extractive_answer(question, results), "extractive_fallback"
+
+
+def offline_metrics(question: str, answer: str, results: list[dict[str, Any]], reference: str | None) -> dict[str, float | None]:
+    context = " ".join(r["text"] for r in results)
+    a = set(tokens(answer))
+    c = set(tokens(context))
+    q = set(tokens(question))
+    groundedness = len(a & c) / max(1, len(a))
+    relevance = len(q & a) / max(1, len(q))
+    reference_score = None
+    if reference:
+        reference_score = len(set(tokens(reference)) & a) / max(1, len(set(tokens(reference))))
+    values = [groundedness, relevance] + ([] if reference_score is None else [reference_score])
+    return {
+        "groundedness": round(groundedness, 4),
+        "answer_relevance": round(relevance, 4),
+        "reference_overlap": None if reference_score is None else round(reference_score, 4),
+        "overall": round(sum(values) / len(values), 4),
+    }
+
+
+@app.on_event("startup")
+def startup() -> None:
+    db().close()
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "service": "enterprise-rag-evaluation-platform"}
+
+
+@app.get("/api/documents")
+def documents() -> dict[str, Any]:
+    conn = db()
+    rows = conn.execute("SELECT * FROM documents ORDER BY created_at DESC").fetchall()
+    conn.close()
+    return {"count": len(rows), "documents": [dict(r) for r in rows]}
+
+
+@app.post("/api/documents/upload")
+async def upload_document(file: UploadFile = File(...)) -> dict[str, Any]:
+    if file.content_type != "application/pdf":
+        raise HTTPException(400, "Only PDF files are supported.")
+    content = await file.read()
+    if len(content) > MAX_FILE_MB * 1024 * 1024:
+        raise HTTPException(413, f"PDF exceeds {MAX_FILE_MB} MB limit.")
+    document_id = uuid.uuid4().hex
+    stored = UPLOAD_DIR / f"{document_id}.pdf"
+    stored.write_bytes(content)
+    try:
+        reader = PdfReader(str(stored))
+        pages = [(page.extract_text() or "") for page in reader.pages]
+    except Exception as exc:
+        stored.unlink(missing_ok=True)
+        raise HTTPException(400, f"Could not read PDF: {exc}") from exc
+    chunks = chunk_pages(pages)
+    conn = db()
+    conn.execute(
+        "INSERT INTO documents(id,filename,stored_path,pages,chunks) VALUES(?,?,?,?,?)",
+        (document_id, file.filename or "document.pdf", str(stored), len(pages), len(chunks)),
+    )
+    conn.executemany(
+        "INSERT INTO chunks(id,document_id,filename,page_start,page_end,text) VALUES(?,?,?,?,?,?)",
+        [
+            (uuid.uuid4().hex, document_id, file.filename or "document.pdf", start, end, text)
+            for start, end, text in chunks
+        ],
+    )
+    conn.commit()
+    conn.close()
+    return {"document_id": document_id, "filename": file.filename, "pages": len(pages), "chunks": len(chunks)}
+
+
+@app.delete("/api/documents/{document_id}")
+def delete_document(document_id: str) -> dict[str, str]:
+    conn = db()
+    row = conn.execute("SELECT stored_path FROM documents WHERE id=?", (document_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(404, "Document not found")
+    conn.execute("DELETE FROM chunks WHERE document_id=?", (document_id,))
+    conn.execute("DELETE FROM documents WHERE id=?", (document_id,))
+    conn.commit()
+    conn.close()
+    Path(row["stored_path"]).unlink(missing_ok=True)
+    return {"status": "deleted"}
 
 
 @app.get("/api/retrieve")
-def api_retrieve(q: str, k: int = 3) -> dict[str, Any]:
-    docs = retrieve(q, max(1, min(k, 10)))
-    return {"query": q, "results": [{"id": d.id, "source": d.source, "text": d.text} for d in docs]}
+def retrieve(
+    q: str = Query(min_length=3, max_length=2000),
+    document_id: str | None = None,
+    k: int = Query(default=5, ge=1, le=10),
+) -> dict[str, Any]:
+    return {"query": q, "results": hybrid_retrieve(q, load_chunks(document_id), k)}
 
 
-@app.post("/api/evaluate")
-def evaluate(body: EvalRequest) -> dict[str, Any]:
-    docs = retrieve(body.query)
-    context = " ".join(d.text for d in docs).lower()
-    answer_tokens = tokenize(body.answer)
-    context_tokens = tokenize(context)
-    groundedness = len(answer_tokens & context_tokens) / max(1, len(answer_tokens))
-    relevance = len(tokenize(body.query) & answer_tokens) / max(1, len(tokenize(body.query)))
-    exact = 1.0 if body.expected and tokenize(body.expected) <= answer_tokens else None
-    scores = [groundedness, relevance] + ([] if exact is None else [exact])
+@app.post("/api/ask")
+def ask(body: AskRequest) -> dict[str, Any]:
+    results = hybrid_retrieve(body.question, load_chunks(body.document_id), body.top_k)
+    answer, mode = llm_answer(body.question, results)
     return {
-        "groundedness": round(groundedness, 3),
-        "relevance": round(relevance, 3),
-        "exact_match": None if exact is None else round(exact, 3),
-        "overall": round(mean(scores), 3),
-        "retrieved": [d.source for d in docs],
+        "question": body.question,
+        "answer": answer,
+        "mode": mode,
+        "citations": [
+            {
+                "source": r["filename"],
+                "pages": f"{r['page_start']}-{r['page_end']}",
+                "score": r["score"],
+            }
+            for r in results
+        ],
+        "retrieved": results,
     }
 
 
+@app.post("/api/evaluate")
+def evaluate(body: EvaluateRequest) -> dict[str, Any]:
+    results = hybrid_retrieve(body.question, load_chunks(body.document_id), body.top_k)
+    answer_metrics = offline_metrics(body.question, body.answer, results, body.reference_answer)
+    return {"metrics": answer_metrics, "retrieved": results}
+
+
 HTML = """
-<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>Enterprise RAG Evaluation Platform</title><style>
-body{font-family:Inter,system-ui;margin:0;background:#0b1020;color:#edf2f7}main{max-width:1000px;margin:auto;padding:40px}
-.card{background:#151d33;border:1px solid #293453;border-radius:16px;padding:24px;margin:18px 0}input,textarea,button{width:100%;box-sizing:border-box;margin-top:10px;padding:12px;border-radius:10px;border:1px solid #34405f;background:#0f1629;color:white}button{cursor:pointer}pre{white-space:pre-wrap}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:700px){.grid{grid-template-columns:1fr}}
+<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Enterprise RAG Evaluation Platform</title>
+<style>
+:root{color-scheme:dark}body{font-family:Inter,system-ui,-apple-system,sans-serif;margin:0;background:#0b1020;color:#eef2ff}main{max-width:1180px;margin:auto;padding:32px 20px 60px}.hero{margin-bottom:22px}.muted{color:#98a4bd}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.card{background:#151d33;border:1px solid #2a385a;border-radius:16px;padding:20px;margin:16px 0}.wide{grid-column:1/-1}input,textarea,button{width:100%;box-sizing:border-box;margin-top:10px;padding:12px;border-radius:10px;border:1px solid #364563;background:#0f1629;color:#fff;font:inherit}button{cursor:pointer}textarea{min-height:110px}.row{display:flex;gap:10px}.row>*{flex:1}pre{white-space:pre-wrap;word-break:break-word;background:#0f1629;border-radius:10px;padding:14px;max-height:420px;overflow:auto}.doc{padding:10px 0;border-bottom:1px solid #25314e}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#202c46;color:#bdc8dc;font-size:12px;margin-right:6px}.score{font-size:22px;font-weight:700}.status{margin-top:10px;color:#b9c4d8}@media(max-width:800px){.grid{grid-template-columns:1fr}.wide{grid-column:auto}}
 </style></head><body><main>
-<h1>Enterprise RAG Evaluation Platform</h1><p>Retrieval, groundedness, relevance and evaluation in one inspectable demo.</p>
-<div class='grid'><div class='card'><h2>Retrieve</h2><input id='q' value='How long do refunds take?'><button onclick='retrieve()'>Run retrieval</button><pre id='r'></pre></div>
-<div class='card'><h2>Evaluate answer</h2><input id='eq' value='How long do refunds take?'><textarea id='a'>Refunds are processed within 5-7 business days after approval.</textarea><button onclick='evaluate()'>Evaluate</button><pre id='e'></pre></div></div>
-</main><script>
-async function retrieve(){let q=document.getElementById('q').value;let r=await fetch('/api/retrieve?q='+encodeURIComponent(q));document.getElementById('r').textContent=JSON.stringify(await r.json(),null,2)}
-async function evaluate(){let b={query:document.getElementById('eq').value,answer:document.getElementById('a').value};let r=await fetch('/api/evaluate',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b)});document.getElementById('e').textContent=JSON.stringify(await r.json(),null,2)}
-retrieve();evaluate();</script></body></html>
+<section class='hero'><span class='pill'>LIVE RAG WORKBENCH</span><h1>Enterprise RAG Evaluation Platform</h1><p class='muted'>Upload PDFs, build a persistent index, retrieve with hybrid BM25 + TF-IDF search, ask grounded questions, inspect citations, and evaluate answers.</p></section>
+<div class='grid'>
+<div class='card'><h2>1. Upload PDF</h2><input id='file' type='file' accept='application/pdf'><button onclick='upload()'>Upload and index</button><div id='uploadStatus' class='status'></div></div>
+<div class='card'><h2>2. Indexed documents</h2><button onclick='loadDocs()'>Refresh documents</button><div id='docs'></div></div>
+<div class='card wide'><h2>3. Ask your documents</h2><div class='row'><input id='question' value='What is the main conclusion of this document?'><input id='docid' placeholder='Optional document ID'></div><button onclick='ask()'>Ask question</button><h3>Answer</h3><pre id='answer'>Upload a PDF and ask a question.</pre><h3>Sources</h3><pre id='sources'>—</pre></div>
+<div class='card'><h2>4. Inspect retrieval</h2><input id='rq' value='summary and conclusion'><button onclick='retrieveDocs()'>Run hybrid retrieval</button><pre id='retrieval'>—</pre></div>
+<div class='card'><h2>5. Evaluate an answer</h2><textarea id='evalAnswer'>The document explains its central findings and supporting evidence.</textarea><button onclick='evaluateAnswer()'>Evaluate</button><pre id='metrics'>—</pre></div>
+</div>
+<script>
+async function loadDocs(){const r=await fetch('/api/documents');const d=await r.json();document.getElementById('docs').innerHTML=d.documents.map(x=>`<div class='doc'><b>${x.filename}</b><br><span class='pill'>${x.pages} pages</span><span class='pill'>${x.chunks} chunks</span><button onclick="document.getElementById('docid').value='${x.id}'">Use</button></div>`).join('')||'<div class="status">No PDFs indexed yet.</div>'}
+async function upload(){const f=document.getElementById('file').files[0];if(!f)return;const fd=new FormData();fd.append('file',f);document.getElementById('uploadStatus').textContent='Indexing…';const r=await fetch('/api/documents/upload',{method:'POST',body:fd});const d=await r.json();document.getElementById('uploadStatus').textContent=r.ok?`Indexed ${d.filename}: ${d.pages} pages, ${d.chunks} chunks.`:(d.detail||'Upload failed');loadDocs()}
+async function ask(){const body={question:document.getElementById('question').value,document_id:document.getElementById('docid').value||null,top_k:5};const r=await fetch('/api/ask',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});const d=await r.json();document.getElementById('answer').textContent=d.answer||d.detail;document.getElementById('sources').textContent=JSON.stringify({mode:d.mode,citations:d.citations},null,2)}
+async function retrieveDocs(){const q=document.getElementById('rq').value;const id=document.getElementById('docid').value;const u='/api/retrieve?q='+encodeURIComponent(q)+(id?'&document_id='+encodeURIComponent(id):'');const r=await fetch(u);document.getElementById('retrieval').textContent=JSON.stringify(await r.json(),null,2)}
+async function evaluateAnswer(){const body={question:document.getElementById('question').value,answer:document.getElementById('evalAnswer').value,document_id:document.getElementById('docid').value||null,top_k:5};const r=await fetch('/api/evaluate',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});document.getElementById('metrics').textContent=JSON.stringify(await r.json(),null,2)}
+loadDocs()
+</script></main></body></html>
 """
 
 

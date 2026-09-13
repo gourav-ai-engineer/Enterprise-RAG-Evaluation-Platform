@@ -1,65 +1,49 @@
 # Enterprise RAG Evaluation Platform
 
-Production-oriented Retrieval-Augmented Generation workbench for **dynamic PDF ingestion, hybrid retrieval, grounded concise Q&A, abstention, citations, evaluation, and reproducible retrieval benchmarks**.
+Production-oriented Retrieval-Augmented Generation workbench for **dynamic PDF ingestion, multi-document hybrid retrieval, reranking, grounded LLM generation, abstention, citations, latency telemetry, evaluation, and reproducible benchmarks**.
 
-## What it does
+## Production query workflow
 
 ```text
-PDF upload
-   ↓
-page-aware extraction + text cleanup
-   ↓
-overlapping chunks + SQLite index
-   ↓
-BM25 + TF-IDF hybrid retrieval
-   ↓
-answerability / evidence gate
-   ↓
-answer-focused sentence selection or optional LLM
-   ↓
-concise answer + deduplicated page citations
-   ↓
-offline quality evaluation + benchmark
+User question
+    ↓
+Document scope: selected document OR entire knowledge base
+    ↓
+Page-aware extraction + paragraph-aware overlapping chunks
+    ↓
+BM25 + TF-IDF hybrid candidate retrieval
+    ↓
+Cross-signal reranking of top candidates
+    ↓
+Evidence / answerability gate
+    ↓
+Best reranked chunks → grounded LLM
+    ↓
+Concise answer + source/page attribution
+    ↓
+Retrieval + rerank + generation + end-to-end latency telemetry
 ```
 
-The corpus is **not hard-coded**. Users upload their own PDFs through the web UI or `POST /api/documents/upload`.
+The corpus is **not hard-coded**. Users upload PDFs through the web UI or `POST /api/documents/upload`. By default a question searches the whole indexed knowledge base; clicking **Use document** scopes the query to one document.
 
-## Key quality safeguards
+## Retrieval and generation
 
-- **Grounded answerability gate:** unsupported questions abstain instead of returning the highest-scoring unrelated chunk.
-- **Answer-focused extraction:** definition and explanatory sentences are preferred over table-like numeric text.
-- **Noise suppression:** computation-time/memory/table-heavy sentences are down-ranked for normal Q&A.
-- **Concise answers:** the deterministic fallback returns at most two high-quality evidence sentences.
-- **Citation deduplication:** the user-facing UI shows at most three distinct source/page groups.
-- **Advanced retrieval data remains available:** `/api/retrieve` and the API payload still expose retrieval details for evaluation.
+- **Hybrid retrieval:** BM25 + TF-IDF bigram retrieval provides complementary lexical signals.
+- **Candidate expansion:** retrieves a larger candidate pool before final ranking.
+- **Reranking:** combines hybrid score, query-term coverage, phrase overlap, and query-intent signals to select the best evidence chunks.
+- **Chunking:** paragraph-aware page chunks with configurable `CHUNK_WORDS` and `CHUNK_OVERLAP` preserve page attribution while reducing oversized context.
+- **Grounded generation:** when `OPENAI_API_KEY` is configured, only reranked chunks are sent to the LLM with an explicit no-invention instruction and `[Source N]` citation format.
+- **Safe fallback:** without an LLM key, the same reranked evidence is used for a deterministic extractive answer; unsupported questions abstain.
+- **Document-aware citations:** duplicate chunks are consolidated into distinct document/page source groups.
 
-## Features
+## Quality safeguards
 
-- PDF upload with file-size and MIME validation
-- Page-aware text extraction and overlapping chunks
-- Document registry and local SQLite index
-- Hybrid BM25 + TF-IDF retrieval
-- Retrieval inspection with component scores
-- Grounded Q&A restricted to retrieved evidence
-- Safe abstention for unsupported questions
-- Source and page citations
-- Optional OpenAI-compatible LLM endpoint
-- Deterministic extractive fallback when no LLM key is configured
-- Offline groundedness, answer-relevance and reference-overlap evaluation
-- Benchmark harness for Recall@K, Hit@K, MRR, nDCG@K and latency
-- Dockerized deployment and regression tests
-
-## Run locally
-
-```bash
-python -m venv .venv
-# Windows: .venv\\Scripts\\activate
-# Linux/macOS: source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app:app --reload
-```
-
-Open `http://127.0.0.1:8000`.
+- **Answerability gate:** weak or unsupported questions abstain instead of returning an unrelated top chunk.
+- **Intent-aware extraction/reranking:** definition, method, purpose and comparison questions receive different evidence preferences.
+- **Noise suppression:** numeric/table-heavy evidence is down-ranked for normal explanatory questions.
+- **Concise answers:** fallback extraction returns at most two high-quality evidence sentences.
+- **Multi-document isolation:** explicit document selection scopes retrieval; otherwise all indexed chunks are candidates.
+- **Telemetry:** `/api/ask` exposes retrieval, reranking, generation and total latency plus candidate/context counts.
 
 ## API
 
@@ -71,9 +55,11 @@ Open `http://127.0.0.1:8000`.
 
 `GET /api/documents`
 
-### Retrieve
+### Retrieve and rerank
 
 `GET /api/retrieve?q=<question>&document_id=<optional>&k=5`
+
+The response includes `answerable`, `evidence_coverage`, `latency`, the reranker name, and ranked evidence chunks.
 
 ### Ask
 
@@ -81,31 +67,17 @@ Open `http://127.0.0.1:8000`.
 
 ```json
 {
-  "question": "What is the main conclusion?",
+  "question": "How does the Transformer differ from BERT?",
   "document_id": "optional-id",
   "top_k": 5
 }
 ```
 
-The response includes `answerable`, `evidence_coverage`, `mode`, `citations`, and the retrieved evidence.
-
-### Evaluate
-
-`POST /api/evaluate`
-
-```json
-{
-  "question": "What is the main conclusion?",
-  "answer": "...",
-  "document_id": "optional-id",
-  "reference_answer": "optional ground truth",
-  "top_k": 5
-}
-```
+The response includes `answerable`, `evidence_coverage`, `mode`, grouped `citations`, `latency`, and the reranked evidence used to construct the answer.
 
 ## LLM configuration
 
-The application remains usable without an LLM key. For generative answers, configure an OpenAI-compatible endpoint:
+For the full retrieval → rerank → LLM workflow, configure an OpenAI-compatible endpoint:
 
 ```env
 OPENAI_API_KEY=your-key
@@ -117,18 +89,34 @@ Any compatible provider can be used by changing `OPENAI_BASE_URL` and `LLM_MODEL
 
 ## Benchmark
 
-The benchmark is intentionally reproducible rather than relying on marketing numbers. See [`benchmark/README.md`](benchmark/README.md) and run:
+Run the reproducible benchmark with:
 
 ```bash
 python benchmark/benchmark.py
 ```
 
-It produces JSON and Markdown reports with retrieval quality and latency. Use the generated measurements—not invented numbers—in a resume, portfolio, or project write-up.
+The benchmark compares **Hybrid** with **Hybrid + Rerank** using Hit@K, Recall@K, MRR, nDCG@K, mean latency and p95 latency. It also reports separate retrieval and reranking latency. Results are generated at runtime and must be rerun after retrieval/chunking changes; no resume metric is hard-coded.
 
-## Regression coverage
+## Regression tests
 
-`tests/test_answer_quality.py` covers the failure mode found during manual testing: a question such as **“What is QIS?”** must prefer the explanatory definition instead of a noisy scoring table, while an unsupported question such as **“What email addresses are used?”** must abstain.
+```bash
+pytest -q
+```
+
+`tests/test_pipeline_v31.py` covers multi-document retrieval, definition-aware reranking, abstention, and query-intent classification. Existing answer-quality tests cover the QIS definition/noise and unsupported-email failure modes.
+
+## Run locally
+
+```bash
+python -m venv .venv
+# Windows: .venv\\Scripts\\activate
+# Linux/macOS: source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn main:app --reload
+```
+
+Open `http://127.0.0.1:8000`.
 
 ## Deployment
 
-The project is containerized for Railway/Render/any Docker host. For production persistence, mount `/app/data` (or set `DATA_DIR`) to a persistent volume; ephemeral storage is suitable for demos only.
+Docker now starts `main:app`. The application is suitable for Railway/Render/any Docker host. Mount `/app/data` (or set `DATA_DIR`) to persistent storage in production because uploaded PDFs and SQLite data are otherwise ephemeral.

@@ -25,7 +25,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(
     title="Enterprise RAG Evaluation Platform",
-    version="2.0.0",
+    version="2.0.1",
     description="Dynamic PDF ingestion, hybrid retrieval, citations and offline evaluation.",
 )
 
@@ -33,6 +33,19 @@ TOKEN_RE = re.compile(r"[a-zA-Z0-9_]+")
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "25"))
 CHUNK_WORDS = int(os.getenv("CHUNK_WORDS", "180"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "40"))
+
+# Common function words are poor evidence for answerability. Keeping them out of
+# retrieval/grounding checks prevents queries such as "what email addresses are
+# used in it" from matching an unrelated chunk simply because it contains "in".
+STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "can",
+    "could", "did", "do", "does", "for", "from", "how", "i", "if", "in",
+    "into", "is", "it", "its", "me", "of", "on", "or", "our", "please",
+    "should", "that", "the", "their", "them", "there", "these", "this",
+    "to", "was", "were", "what", "when", "where", "which", "who", "why",
+    "with", "would", "you", "your",
+}
+ABSTAIN_MESSAGE = "I could not find enough relevant evidence in the indexed documents to answer that question."
 
 
 def db() -> sqlite3.Connection:
@@ -65,6 +78,10 @@ def db() -> sqlite3.Connection:
 
 def tokens(text: str) -> list[str]:
     return [t.lower() for t in TOKEN_RE.findall(text)]
+
+
+def content_tokens(text: str) -> list[str]:
+    return [token for token in tokens(text) if token not in STOPWORDS and len(token) > 1]
 
 
 def chunk_pages(pages: list[str]) -> list[tuple[int, int, str]]:
@@ -102,14 +119,14 @@ def load_chunks(document_id: str | None = None) -> list[sqlite3.Row]:
 
 
 def bm25_scores(query: str, docs: list[str]) -> list[float]:
-    q = tokens(query)
+    q = content_tokens(query)
     if not docs or not q:
         return [0.0] * len(docs)
     term_df = Counter()
     frequencies = []
     lengths = []
     for doc in docs:
-        tf = Counter(tokens(doc))
+        tf = Counter(content_tokens(doc))
         frequencies.append(tf)
         lengths.append(sum(tf.values()))
         term_df.update(tf.keys())
@@ -134,7 +151,7 @@ def hybrid_retrieve(query: str, rows: list[sqlite3.Row], k: int) -> list[dict[st
         return []
     texts = [row["text"] for row in rows]
     lexical = bm25_scores(query, texts)
-    vectorizer = TfidfVectorizer(lowercase=True, ngram_range=(1, 2), min_df=1)
+    vectorizer = TfidfVectorizer(lowercase=True, stop_words="english", ngram_range=(1, 2), min_df=1)
     matrix = vectorizer.fit_transform(texts)
     qvec = vectorizer.transform([query])
     dense = cosine_similarity(qvec, matrix)[0].tolist()
@@ -166,6 +183,26 @@ def hybrid_retrieve(query: str, rows: list[sqlite3.Row], k: int) -> list[dict[st
     ]
 
 
+def evidence_coverage(question: str, results: list[dict[str, Any]]) -> float:
+    """Measure meaningful question-term coverage in retrieved evidence."""
+    qterms = set(content_tokens(question))
+    if not qterms or not results:
+        return 0.0
+    context_terms = set(content_tokens(" ".join(r["text"] for r in results)))
+    return len(qterms & context_terms) / len(qterms)
+
+
+def has_sufficient_evidence(question: str, results: list[dict[str, Any]]) -> bool:
+    """Return True only when retrieval contains enough meaningful query evidence."""
+    qterms = set(content_tokens(question))
+    if not qterms or not results:
+        return False
+    coverage = evidence_coverage(question, results)
+    required_terms = max(1, math.ceil(len(qterms) * 0.34))
+    matched_terms = math.floor(coverage * len(qterms))
+    return matched_terms >= required_terms
+
+
 class AskRequest(BaseModel):
     question: str = Field(min_length=3, max_length=2000)
     document_id: str | None = None
@@ -181,22 +218,24 @@ class EvaluateRequest(BaseModel):
 
 
 def extractive_answer(question: str, results: list[dict[str, Any]]) -> str:
-    if not results:
-        return "I could not find relevant evidence in the indexed documents."
-    sentences: list[str] = []
-    qset = set(tokens(question))
+    if not has_sufficient_evidence(question, results):
+        return ABSTAIN_MESSAGE
+    sentences: list[tuple[int, str]] = []
+    qset = set(content_tokens(question))
     for result in results:
         for sentence in re.split(r"(?<=[.!?])\s+", result["text"]):
-            overlap = len(qset & set(tokens(sentence)))
+            overlap = len(qset & set(content_tokens(sentence)))
             if overlap:
                 sentences.append((overlap, sentence.strip()))
     best = [s for _, s in sorted(sentences, key=lambda x: -x[0])[:4]]
     if not best:
-        best = [results[0]["text"]]
+        return ABSTAIN_MESSAGE
     return " ".join(best)
 
 
 def llm_answer(question: str, results: list[dict[str, Any]]) -> tuple[str, str]:
+    if not has_sufficient_evidence(question, results):
+        return ABSTAIN_MESSAGE, "abstain"
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return extractive_answer(question, results), "extractive"
@@ -325,17 +364,26 @@ def retrieve(
     document_id: str | None = None,
     k: int = Query(default=5, ge=1, le=10),
 ) -> dict[str, Any]:
-    return {"query": q, "results": hybrid_retrieve(q, load_chunks(document_id), k)}
+    results = hybrid_retrieve(q, load_chunks(document_id), k)
+    return {
+        "query": q,
+        "evidence_coverage": round(evidence_coverage(q, results), 4),
+        "answerable": has_sufficient_evidence(q, results),
+        "results": results,
+    }
 
 
 @app.post("/api/ask")
 def ask(body: AskRequest) -> dict[str, Any]:
     results = hybrid_retrieve(body.question, load_chunks(body.document_id), body.top_k)
     answer, mode = llm_answer(body.question, results)
+    answerable = has_sufficient_evidence(body.question, results)
     return {
         "question": body.question,
         "answer": answer,
         "mode": mode,
+        "answerable": answerable,
+        "evidence_coverage": round(evidence_coverage(body.question, results), 4),
         "citations": [
             {
                 "source": r["filename"],
@@ -343,7 +391,7 @@ def ask(body: AskRequest) -> dict[str, Any]:
                 "score": r["score"],
             }
             for r in results
-        ],
+        ] if answerable else [],
         "retrieved": results,
     }
 
@@ -359,7 +407,7 @@ HTML = """
 <!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
 <title>Enterprise RAG Evaluation Platform</title>
 <style>
-:root{color-scheme:dark}body{font-family:Inter,system-ui,-apple-system,sans-serif;margin:0;background:#0b1020;color:#eef2ff}main{max-width:1180px;margin:auto;padding:32px 20px 60px}.hero{margin-bottom:22px}.muted{color:#98a4bd}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.card{background:#151d33;border:1px solid #2a385a;border-radius:16px;padding:20px;margin:16px 0}.wide{grid-column:1/-1}input,textarea,button{width:100%;box-sizing:border-box;margin-top:10px;padding:12px;border-radius:10px;border:1px solid #364563;background:#0f1629;color:#fff;font:inherit}button{cursor:pointer}textarea{min-height:110px}.row{display:flex;gap:10px}.row>*{flex:1}pre{white-space:pre-wrap;word-break:break-word;background:#0f1629;border-radius:10px;padding:14px;max-height:420px;overflow:auto}.doc{padding:10px 0;border-bottom:1px solid #25314e}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#202c46;color:#bdc8dc;font-size:12px;margin-right:6px}.score{font-size:22px;font-weight:700}.status{margin-top:10px;color:#b9c4d8}@media(max-width:800px){.grid{grid-template-columns:1fr}.wide{grid-column:auto}}
+:root{color-scheme:dark}body{font-family:Inter,system-ui,-apple-system,sans-serif;margin:0;background:#0b1020;color:#eef2ff}main{max-width:1180px;margin:auto;padding:32px 20px 60px}.hero{margin-bottom:22px}.muted{color:#98a4bd}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.card{background:#151d33;border:1px solid #2a385a;border-radius:16px;padding:20px;margin:16px 0}.wide{grid-column:1/-1}input,textarea,button{width:100%;box-sizing:border-box;margin-top:10px;padding:12px;border-radius:10px;border:1px solid #364563;background:#0f1629;color:#fff;font:inherit}button{cursor:pointer}textarea{min-height:110px}.row{display:flex;gap:10px}.row>*{flex:1}pre{white-space:pre-wrap;word-break:break-word;background:#0f1629;border-radius:10px;padding:14px;max-height:420px;overflow:auto}.doc{padding:10px 0;border-bottom:1px solid #25314e}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#202c46;color:#bdc8dc;font-size:12px;margin-right:6px}.score{font-size:22px;font-weight:700}.status{margin-top:10px;color:#b9c4d8}.warning{color:#f2c46d}@media(max-width:800px){.grid{grid-template-columns:1fr}.wide{grid-column:auto}}
 </style></head><body><main>
 <section class='hero'><span class='pill'>LIVE RAG WORKBENCH</span><h1>Enterprise RAG Evaluation Platform</h1><p class='muted'>Upload PDFs, build a persistent index, retrieve with hybrid BM25 + TF-IDF search, ask grounded questions, inspect citations, and evaluate answers.</p></section>
 <div class='grid'>
@@ -372,7 +420,7 @@ HTML = """
 <script>
 async function loadDocs(){const r=await fetch('/api/documents');const d=await r.json();document.getElementById('docs').innerHTML=d.documents.map(x=>`<div class='doc'><b>${x.filename}</b><br><span class='pill'>${x.pages} pages</span><span class='pill'>${x.chunks} chunks</span><button onclick="document.getElementById('docid').value='${x.id}'">Use</button></div>`).join('')||'<div class="status">No PDFs indexed yet.</div>'}
 async function upload(){const f=document.getElementById('file').files[0];if(!f)return;const fd=new FormData();fd.append('file',f);document.getElementById('uploadStatus').textContent='Indexing…';const r=await fetch('/api/documents/upload',{method:'POST',body:fd});const d=await r.json();document.getElementById('uploadStatus').textContent=r.ok?`Indexed ${d.filename}: ${d.pages} pages, ${d.chunks} chunks.`:(d.detail||'Upload failed');loadDocs()}
-async function ask(){const body={question:document.getElementById('question').value,document_id:document.getElementById('docid').value||null,top_k:5};const r=await fetch('/api/ask',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});const d=await r.json();document.getElementById('answer').textContent=d.answer||d.detail;document.getElementById('sources').textContent=JSON.stringify({mode:d.mode,citations:d.citations},null,2)}
+async function ask(){const body={question:document.getElementById('question').value,document_id:document.getElementById('docid').value||null,top_k:5};const r=await fetch('/api/ask',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});const d=await r.json();document.getElementById('answer').textContent=d.answer||d.detail;document.getElementById('sources').textContent=JSON.stringify({mode:d.mode,answerable:d.answerable,evidence_coverage:d.evidence_coverage,citations:d.citations},null,2)}
 async function retrieveDocs(){const q=document.getElementById('rq').value;const id=document.getElementById('docid').value;const u='/api/retrieve?q='+encodeURIComponent(q)+(id?'&document_id='+encodeURIComponent(id):'');const r=await fetch(u);document.getElementById('retrieval').textContent=JSON.stringify(await r.json(),null,2)}
 async function evaluateAnswer(){const body={question:document.getElementById('question').value,answer:document.getElementById('evalAnswer').value,document_id:document.getElementById('docid').value||null,top_k:5};const r=await fetch('/api/evaluate',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});document.getElementById('metrics').textContent=JSON.stringify(await r.json(),null,2)}
 loadDocs()

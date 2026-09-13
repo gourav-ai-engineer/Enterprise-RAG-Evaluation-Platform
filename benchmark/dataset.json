@@ -1,0 +1,22 @@
+{
+  "documents": [
+    {"id": "d1", "text": "Refunds are processed within five to seven business days after approval. Refund requests must include the original transaction reference."},
+    {"id": "d2", "text": "Enterprise plans include single sign-on, audit logs, and role based access control. Administrators can manage organization members."},
+    {"id": "d3", "text": "The standard API rate limit is 100 requests per minute per tenant. Burst traffic may receive HTTP 429 responses."},
+    {"id": "d4", "text": "Critical incidents must be escalated to the on-call engineer immediately. The incident commander coordinates mitigation and communication."},
+    {"id": "d5", "text": "Production deployments require a successful automated test suite and an approved change record before release."},
+    {"id": "d6", "text": "Data retention defaults to 30 days for application logs. Enterprise customers may request a longer retention period."}
+  ],
+  "queries": [
+    {"id": "q1", "query": "How many business days do refunds take after approval?", "relevant": ["d1"]},
+    {"id": "q2", "query": "What security features are available on enterprise plans?", "relevant": ["d2"]},
+    {"id": "q3", "query": "What is the API request limit per tenant?", "relevant": ["d3"]},
+    {"id": "q4", "query": "Who should receive a critical incident escalation?", "relevant": ["d4"]},
+    {"id": "q5", "query": "What is required before a production deployment?", "relevant": ["d5"]},
+    {"id": "q6", "query": "How long are application logs retained by default?", "relevant": ["d6"]},
+    {"id": "q7", "query": "Can administrators manage organization members?", "relevant": ["d2"]},
+    {"id": "q8", "query": "What happens during an API burst?", "relevant": ["d3"]},
+    {"id": "q9", "query": "Who coordinates incident mitigation and communication?", "relevant": ["d4"]},
+    {"id": "q10", "query": "Can enterprise customers have longer log retention?", "relevant": ["d6"]}
+  ]
+}

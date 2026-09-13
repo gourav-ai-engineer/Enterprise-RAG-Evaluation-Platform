@@ -28,21 +28,13 @@ def test_evaluate_grounded_answer_scores_well() -> None:
         },
     )
     assert response.status_code == 200
-    assert response.json()["scores"]["groundedness"] > 0.8
+    assert response.json()["groundedness"] > 0.8
+    assert response.json()["relevance"] > 0.3
 
 
-def test_batch_evaluation() -> None:
-    response = client.post(
-        "/api/evaluate/batch",
-        json={
-            "items": [
-                {"query": "What is the API rate limit?", "answer": "100 requests per minute."},
-                {"query": "What is required for deployment?", "answer": "A successful test suite and approved change record."},
-            ]
-        },
-    )
-    assert response.status_code == 200
-    assert response.json()["count"] == 2
+def test_validation_rejects_short_query() -> None:
+    response = client.get("/api/retrieve", params={"q": "x"})
+    assert response.status_code == 422
 
 
 def test_retrieval_is_deterministic() -> None:

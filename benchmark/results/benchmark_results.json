@@ -1,0 +1,11 @@
+{
+  "dataset": "benchmark/dataset.json",
+  "query_count": 15,
+  "document_count": 15,
+  "note": "Reference quality results from the versioned benchmark. Latency is environment-specific and should be regenerated on the target machine/CI runner.",
+  "results": [
+    {"retriever":"BM25","Hit@1":0.9333,"Hit@3":1.0,"Recall@5":1.0,"RR":0.9556,"NDCG@5":0.9667,"latency_ms_reference":1.2488,"latency_p95_ms_reference":1.6080},
+    {"retriever":"TF-IDF","Hit@1":0.9333,"Hit@3":0.9333,"Recall@5":1.0,"RR":0.9500,"NDCG@5":0.9620,"latency_ms_reference":5.6455,"latency_p95_ms_reference":6.8893},
+    {"retriever":"Hybrid-RRF","Hit@1":0.9333,"Hit@3":1.0,"Recall@5":1.0,"RR":0.9556,"NDCG@5":0.9667,"latency_ms_reference":6.5969,"latency_p95_ms_reference":7.4596}
+  ]
+}

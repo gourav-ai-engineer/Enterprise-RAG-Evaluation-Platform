@@ -1,8 +1,9 @@
-from app import ABSTAIN_MESSAGE, extractive_answer, has_sufficient_evidence
+from main import ABSTAIN, answerable, extractive
 
 
 def result(text: str):
     return [{
+        "document_id": "paper",
         "filename": "paper.pdf",
         "page_start": 5,
         "page_end": 6,
@@ -17,15 +18,16 @@ def test_qis_question_prefers_definition_over_table_noise():
         "We presented QIS, a quantum information-theoretic framework for Transformer attention-head pruning. "
         "By combining Von Neumann Entropy, Quantum Jensen-Shannon Divergence, and Quantum Fidelity, QIS captures spectral complexity."
     )
-    answer = extractive_answer("What is QIS?", results)
+    answer = extractive("What is QIS?", results)
     assert "quantum information-theoretic framework" in answer.lower()
     assert "computation time" not in answer.lower()
 
 
 def test_unanswerable_question_abstains():
     results = result("QIS combines Von Neumann Entropy, QJSD, and Quantum Fidelity.")
-    assert not has_sufficient_evidence("What email addresses are used?", results)
-    assert extractive_answer("What email addresses are used?", results) == ABSTAIN_MESSAGE
+    question = "What email addresses are used?"
+    assert not answerable(question, results)
+    assert extractive(question, results) == ABSTAIN
 
 
 def test_qis_combination_is_concise():
@@ -33,7 +35,7 @@ def test_qis_combination_is_concise():
         "QIS combines Von Neumann Entropy, Quantum Jensen-Shannon Divergence, and Quantum Fidelity. "
         "Table V reports scoring overhead and model inference speedup."
     )
-    answer = extractive_answer("What does QIS combine?", results)
+    answer = extractive("What does QIS combine?", results)
     assert "Von Neumann Entropy" in answer
     assert "Quantum Fidelity" in answer
     assert len(answer) < 500

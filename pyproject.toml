@@ -1,0 +1,17 @@
+[project]
+name = "enterprise-rag-evaluation-platform"
+version = "1.1.0"
+description = "Inspectable retrieval and RAG answer-quality evaluation service"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "fastapi==0.116.1",
+  "uvicorn[standard]==0.35.0",
+  "pydantic==2.11.7",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

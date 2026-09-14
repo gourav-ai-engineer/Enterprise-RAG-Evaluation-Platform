@@ -38,6 +38,8 @@ def migrate() -> None:
         if name not in cols:
             conn.execute(f"ALTER TABLE documents ADD COLUMN {name} {definition}")
 
+    # production_main creates this index during import. Drop it while legacy
+    # files are being hashed so duplicate legacy rows can be removed safely.
     conn.execute("DROP INDEX IF EXISTS ux_documents_sha256")
 
     conn.execute("""CREATE TABLE IF NOT EXISTS collections(
@@ -102,7 +104,6 @@ def quality(row: sqlite3.Row) -> float:
     return round((0.7 * density + 0.3) * 100, 1)
 
 
-# Remove lower-layer endpoints that must be owned by the enterprise entrypoint.
 app.routes[:] = [
     route for route in app.routes
     if getattr(route, "path", None) not in {"/", "/health"}
@@ -141,6 +142,8 @@ def overview() -> dict[str, Any]:
         "avg_evidence_coverage": round(float(t["coverage"] or 0), 4),
         "positive_feedback_rate": round((f["positive"] or 0) / fn, 4) if fn else 0,
         "retrieval_cache_entries": len(base._retrieve_cache),
+        "retrieval_cache_hits": getattr(base, "_retrieve_cache_hits", 0),
+        "retrieval_cache_misses": getattr(base, "_retrieve_cache_misses", 0),
         "ingestion_cache_entries": len(list(base.CACHE_DIR.glob("*.json"))),
     }
 
@@ -163,10 +166,7 @@ async def create_collection(payload: dict[str, Any]) -> dict[str, Any]:
     cid, stamp = uuid.uuid4().hex, now()
     conn = core.db()
     try:
-        conn.execute(
-            "INSERT INTO collections VALUES(?,?,?,?,?)",
-            (cid, name, str(payload.get("description", "")).strip(), stamp, stamp),
-        )
+        conn.execute("INSERT INTO collections VALUES(?,?,?,?,?)", (cid, name, str(payload.get("description", "")).strip(), stamp, stamp))
         conn.commit()
     except sqlite3.IntegrityError:
         conn.rollback()
@@ -226,15 +226,9 @@ def reprocess(document_id: str) -> dict[str, Any]:
         raise HTTPException(400, f"Could not reprocess PDF: {exc}") from exc
     conn = core.db()
     conn.execute("DELETE FROM chunks WHERE document_id=?", (document_id,))
-    conn.executemany(
-        "INSERT INTO chunks(id,document_id,filename,page_start,page_end,text) VALUES(?,?,?,?,?,?)",
-        [(uuid.uuid4().hex, document_id, row["filename"], s, e, t) for s, e, t in chunks],
-    )
+    conn.executemany("INSERT INTO chunks(id,document_id,filename,page_start,page_end,text) VALUES(?,?,?,?,?,?)", [(uuid.uuid4().hex, document_id, row["filename"], s, e, t) for s, e, t in chunks])
     new_version = int(row["version"] or 1) + 1
-    conn.execute(
-        "UPDATE documents SET pages=?,chunks=?,version=?,status='indexed',updated_at=? WHERE id=?",
-        (len(pages), len(chunks), new_version, now(), document_id),
-    )
+    conn.execute("UPDATE documents SET pages=?,chunks=?,version=?,status='indexed',updated_at=? WHERE id=?", (len(pages), len(chunks), new_version, now(), document_id))
     conn.commit()
     conn.close()
     if row["sha256"]:
@@ -275,10 +269,7 @@ async def feedback(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(400, "question, answer and rating (-1 or 1) are required")
     fid = uuid.uuid4().hex
     conn = core.db()
-    conn.execute(
-        "INSERT INTO feedback VALUES(?,?,?,?,?,?,?)",
-        (fid, q, a, rating, json.dumps(payload.get("document_ids") or []), payload.get("mode"), now()),
-    )
+    conn.execute("INSERT INTO feedback VALUES(?,?,?,?,?,?,?)", (fid, q, a, rating, json.dumps(payload.get("document_ids") or []), payload.get("mode"), now()))
     conn.commit()
     conn.close()
     audit("feedback.submit", "answer", fid, {"rating": rating})
@@ -290,27 +281,14 @@ async def trace(payload: dict[str, Any]) -> dict[str, Any]:
     lat = payload.get("latency") or {}
     tid = uuid.uuid4().hex
     conn = core.db()
-    conn.execute(
-        "INSERT INTO query_traces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (
-            tid,
-            str(payload.get("question", ""))[:2000],
-            json.dumps(payload.get("scope_document_ids") or []),
-            payload.get("mode"),
-            payload.get("model"),
-            int(bool(payload.get("answerable"))),
-            float(payload.get("evidence_coverage") or 0),
-            float(lat.get("retrieval_ms") or 0),
-            float(lat.get("rerank_ms") or 0),
-            float(lat.get("generation_ms") or 0),
-            float(lat.get("ttft_ms") or 0),
-            float(lat.get("total_ms") or 0),
-            int(lat.get("candidate_count") or 0),
-            int(lat.get("context_chunks") or 0),
-            int(bool(payload.get("cache_hit"))),
-            now(),
-        ),
-    )
+    conn.execute("INSERT INTO query_traces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+        tid, str(payload.get("question", ""))[:2000], json.dumps(payload.get("scope_document_ids") or []),
+        payload.get("mode"), payload.get("model"), int(bool(payload.get("answerable"))),
+        float(payload.get("evidence_coverage") or 0), float(lat.get("retrieval_ms") or 0),
+        float(lat.get("rerank_ms") or 0), float(lat.get("generation_ms") or 0), float(lat.get("ttft_ms") or 0),
+        float(lat.get("total_ms") or 0), int(lat.get("candidate_count") or 0), int(lat.get("context_chunks") or 0),
+        int(bool(payload.get("cache_hit"))), now(),
+    ))
     conn.commit()
     conn.close()
     return {"id": tid, "saved": True}
@@ -327,8 +305,6 @@ def audit_logs(limit: int = 50) -> dict[str, Any]:
 
 migrate()
 
-# Reuse the working Gemini UI. The previous implementation referenced
-# production_main.HTML, but the HTML is owned by gemini_main.
 ENTERPRISE_HTML = ui.HTML.replace(
     '<main class="main">',
     '<main class="main"><section id="enterpriseBar" style="margin-bottom:14px;border:1px solid #223049;background:#0d1624;border-radius:12px;padding:12px 14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
@@ -341,15 +317,51 @@ ENTERPRISE_HTML = ui.HTML.replace(
     '<a href="/docs" target="_blank" style="margin-left:auto;border:1px solid #223049;background:#101b2b;color:#d4deed;padding:6px 9px;border-radius:7px;text-decoration:none;font-size:11px">API</a>'
     '</section>'
 )
+
 ENTERPRISE_HTML = ENTERPRISE_HTML.replace(
     '</body></html>',
-    '<script>async function enterpriseTelemetry(){try{const r=await fetch("/api/enterprise/overview");if(!r.ok)return;const d=await r.json();'
-    'document.getElementById("eDocs").textContent=`Docs ${d.indexed_documents}/${d.documents}`;'
-    'document.getElementById("eQueries").textContent=`Queries ${d.queries}`;'
-    'document.getElementById("eCoverage").textContent=`Evidence ${(d.avg_evidence_coverage*100).toFixed(0)}%`;'
-    'document.getElementById("eLatency").textContent=`Avg ${d.avg_latency_ms.toFixed(0)} ms`;'
-    'document.getElementById("eCache").textContent=`Cache ${d.retrieval_cache_entries}R · ${d.ingestion_cache_entries}I`;}catch{}}'
-    'enterpriseTelemetry();setInterval(enterpriseTelemetry,15000);</script></body></html>'
+    r'''<script>
+async function enterpriseTelemetry(){try{const r=await fetch('/api/enterprise/overview');if(!r.ok)return;const d=await r.json();
+const q=document.getElementById('eQueries'),d1=document.getElementById('eDocs'),c=document.getElementById('eCoverage'),l=document.getElementById('eLatency'),ca=document.getElementById('eCache');
+if(d1)d1.textContent=`Docs ${d.indexed_documents}/${d.documents}`;if(q)q.textContent=`Queries ${d.queries}`;if(c)c.textContent=`Evidence ${(d.avg_evidence_coverage*100).toFixed(0)}%`;if(l)l.textContent=`Avg ${d.avg_latency_ms.toFixed(0)} ms`;if(ca)ca.textContent=`Cache ${d.retrieval_cache_hits}H/${d.retrieval_cache_misses}M · ${d.ingestion_cache_entries}I`;}catch{}}
+enterpriseTelemetry();setInterval(enterpriseTelemetry,15000);
+
+(function(){
+const originalFetch=window.fetch;
+window.fetch=async function(input,init){
+  const url=typeof input==='string'?input:input.url;
+  if(!url.endsWith('/api/ask/stream')) return originalFetch.apply(this,arguments);
+  let request={};try{request=JSON.parse((init&&init.body)||'{}')}catch{}
+  let beforeHits=0;try{beforeHits=(await (await originalFetch('/api/cache/stats')).json()).retrieval_cache_hits||0}catch{}
+  const response=await originalFetch.apply(this,arguments);
+  const clone=response.clone();
+  (async()=>{
+    try{
+      const reader=clone.body.getReader(),decoder=new TextDecoder();let buf='';
+      while(true){const {value,done}=await reader.read();if(done)break;buf+=decoder.decode(value,{stream:true});
+        const blocks=buf.split('\n\n');buf=blocks.pop()||'';
+        for(const block of blocks){if(!block.includes('event: result'))continue;const line=block.split('\n').find(x=>x.startsWith('data:'));if(!line)continue;
+          const result=JSON.parse(line.slice(5).trim());
+          let afterHits=beforeHits;try{afterHits=(await (await originalFetch('/api/cache/stats')).json()).retrieval_cache_hits||beforeHits}catch{}
+          const cacheHit=afterHits>beforeHits;
+          await originalFetch('/api/traces',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...result,cache_hit:cacheHit})});
+          const answerBox=document.getElementById('answer');if(answerBox&&result.answer){
+            const old=document.getElementById('feedbackBar');if(old)old.remove();
+            const bar=document.createElement('div');bar.id='feedbackBar';bar.style='display:flex;gap:8px;margin-top:10px;align-items:center';
+            bar.innerHTML='<span style="color:#7f8ca4;font-size:11px">Was this answer useful?</span><button id="fbUp" class="mini">👍 Helpful</button><button id="fbDown" class="mini">👎 Not helpful</button>';
+            answerBox.appendChild(bar);
+            async function sendFeedback(rating){await originalFetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:request.question,answer:result.answer,rating,document_ids:result.scope_document_ids||[],mode:result.mode})});bar.innerHTML='<span style="color:#50d8a2;font-size:11px">Feedback recorded.</span>'}
+            document.getElementById('fbUp').onclick=()=>sendFeedback(1);document.getElementById('fbDown').onclick=()=>sendFeedback(-1);
+          }
+        }
+      }
+    }catch(e){console.debug('enterprise trace hook',e)}
+    enterpriseTelemetry();
+  })();
+  return response;
+};
+})();
+</script></body></html>'''
 )
 
 app.routes[:] = [r for r in app.routes if getattr(r, "path", None) != "/"]

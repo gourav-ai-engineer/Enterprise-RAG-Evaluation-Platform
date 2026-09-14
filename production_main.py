@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import uuid
 from pathlib import Path
 
@@ -23,7 +22,6 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "25"))
 
-# Remove the original upload and root routes. The Gemini query route is retained.
 app.routes[:] = [
     route for route in app.routes
     if getattr(route, "path", None) not in {"/", "/api/documents/upload"}
@@ -94,7 +92,6 @@ async def upload_document(file: UploadFile = File(...)) -> dict:
     filename = Path(file.filename or "document.pdf").name
     if Path(filename).suffix.lower() != ".pdf" and file.content_type != "application/pdf":
         raise HTTPException(400, "Only PDF files are supported.")
-
     content = await file.read()
     if not content:
         raise HTTPException(400, "The uploaded PDF is empty.")
@@ -107,14 +104,9 @@ async def upload_document(file: UploadFile = File(...)) -> dict:
     existing = find_by_sha(sha256)
     if existing:
         return {
-            "id": existing["id"],
-            "document_id": existing["id"],
-            "filename": existing["filename"],
-            "pages": existing["pages"],
-            "chunks": existing["chunks"],
-            "sha256": sha256,
-            "duplicate": True,
-            "cache_hit": True,
+            "id": existing["id"], "document_id": existing["id"], "filename": existing["filename"],
+            "pages": existing["pages"], "chunks": existing["chunks"], "sha256": sha256,
+            "duplicate": True, "cache_hit": True,
             "message": "This PDF is already indexed; the existing document was reused.",
         }
 
@@ -153,47 +145,43 @@ async def upload_document(file: UploadFile = File(...)) -> dict:
         conn.close()
         raise
     conn.close()
-
-    # New indexed material invalidates retrieval-cache entries.
     _retrieve_cache.clear()
 
     return {
-        "id": document_id,
-        "document_id": document_id,
-        "filename": filename,
-        "pages": len(pages),
-        "chunks": len(chunks),
-        "sha256": sha256,
-        "duplicate": False,
-        "cache_hit": cache_hit,
-        "message": "PDF indexed successfully.",
+        "id": document_id, "document_id": document_id, "filename": filename,
+        "pages": len(pages), "chunks": len(chunks), "sha256": sha256,
+        "duplicate": False, "cache_hit": cache_hit, "message": "PDF indexed successfully.",
     }
 
 
-# Small process-local retrieval cache. The document IDs and chunk IDs are part of
-# the key, so answers cannot accidentally cross document scopes.
 _retrieve_cache: dict[tuple, list[dict]] = {}
+_retrieve_cache_hits = 0
+_retrieve_cache_misses = 0
 _ORIGINAL_HYBRID_RETRIEVE = core.hybrid_retrieve
 
 
 def cached_hybrid_retrieve(query: str, rows, k: int):
+    global _retrieve_cache_hits, _retrieve_cache_misses
     chunk_ids = tuple(row["id"] for row in rows)
     key = (query.strip().lower(), chunk_ids, int(k))
     hit = _retrieve_cache.get(key)
     if hit is not None:
+        _retrieve_cache_hits += 1
+        core._last_retrieval_cache_hit = True
         return [dict(item) for item in hit]
+    _retrieve_cache_misses += 1
+    core._last_retrieval_cache_hit = False
     result = _ORIGINAL_HYBRID_RETRIEVE(query, rows, k)
     _retrieve_cache[key] = [dict(item) for item in result]
     return result
 
 
+core._last_retrieval_cache_hit = False
 core.hybrid_retrieve = cached_hybrid_retrieve
 
 
 @base.app.get("/")
 async def root() -> HTMLResponse:
-    # Reuse the production Gemini UI, but make duplicate uploads update the
-    # existing browser-side document list instead of adding the same SHA twice.
     html = base.HTML
     old = "docs.unshift(d);selected.add(d.document_id);renderDocs();$('provider').textContent='Indexed · '+d.filename;$('file').value=''"
     new = "if(d.duplicate){const idx=docs.findIndex(x=>x.id===d.id);if(idx>=0)docs.splice(idx,1);docs.unshift(d);selected.add(d.document_id);renderDocs();$('provider').textContent='Already indexed · '+d.filename}else{docs.unshift(d);selected.add(d.document_id);renderDocs();$('provider').textContent='Indexed · '+d.filename}$('file').value=''"
@@ -207,6 +195,8 @@ def cache_stats() -> dict:
     files = list(CACHE_DIR.glob("*.json"))
     return {
         "retrieval_cache_entries": len(_retrieve_cache),
+        "retrieval_cache_hits": _retrieve_cache_hits,
+        "retrieval_cache_misses": _retrieve_cache_misses,
         "ingestion_cache_entries": len(files),
         "cache_directory": str(CACHE_DIR),
     }

@@ -16,7 +16,7 @@ import production_main as base
 import main as core
 
 app = base.app
-VERSION = "4.2.0"
+VERSION = "4.2.1"
 
 
 def now() -> str:
@@ -38,10 +38,7 @@ def migrate() -> None:
         if name not in cols:
             conn.execute(f"ALTER TABLE documents ADD COLUMN {name} {definition}")
 
-    # production_main creates this index during import. Drop it while legacy
-    # files are being hashed so duplicate legacy rows can be removed safely.
     conn.execute("DROP INDEX IF EXISTS ux_documents_sha256")
-
     conn.execute("""CREATE TABLE IF NOT EXISTS collections(
         id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT DEFAULT '',
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
@@ -123,7 +120,9 @@ def health() -> dict[str, Any]:
 @app.get("/api/enterprise/overview")
 def overview() -> dict[str, Any]:
     conn = core.db()
-    d = conn.execute("SELECT COUNT(*) total, SUM(status='indexed') indexed FROM documents").fetchone()
+    # INDEXED is a SQL keyword in SQLite. Use an explicit alias that cannot
+    # collide with SQLite grammar so the telemetry endpoint remains valid.
+    d = conn.execute("SELECT COUNT(*) AS total, SUM(CASE WHEN status='indexed' THEN 1 ELSE 0 END) AS indexed_documents FROM documents").fetchone()
     c = conn.execute("SELECT COUNT(*) FROM collections").fetchone()[0]
     t = conn.execute("""SELECT COUNT(*) n, AVG(total_ms) avg_ms, AVG(evidence_coverage) coverage,
                                SUM(answerable) answerable FROM query_traces""").fetchone()
@@ -134,7 +133,7 @@ def overview() -> dict[str, Any]:
     return {
         "version": VERSION,
         "documents": int(d["total"] or 0),
-        "indexed_documents": int(d["indexed"] or 0),
+        "indexed_documents": int(d["indexed_documents"] or 0),
         "collections": int(c),
         "queries": n,
         "answerable_rate": round((t["answerable"] or 0) / n, 4) if n else 0,
@@ -324,45 +323,21 @@ ENTERPRISE_HTML = ENTERPRISE_HTML.replace(
 async function enterpriseTelemetry(){try{const r=await fetch('/api/enterprise/overview');if(!r.ok)return;const d=await r.json();
 const q=document.getElementById('eQueries'),d1=document.getElementById('eDocs'),c=document.getElementById('eCoverage'),l=document.getElementById('eLatency'),ca=document.getElementById('eCache');
 if(d1)d1.textContent=`Docs ${d.indexed_documents}/${d.documents}`;if(q)q.textContent=`Queries ${d.queries}`;if(c)c.textContent=`Evidence ${(d.avg_evidence_coverage*100).toFixed(0)}%`;if(l)l.textContent=`Avg ${d.avg_latency_ms.toFixed(0)} ms`;if(ca)ca.textContent=`Cache ${d.retrieval_cache_hits}H/${d.retrieval_cache_misses}M · ${d.ingestion_cache_entries}I`;}catch{}}
-enterpriseTelemetry();setInterval(enterpriseTelemetry,15000);
-
+enterpriseTelemetry();setInterval(enterpriseTelemetry,5000);
 (function(){
 const originalFetch=window.fetch;
 window.fetch=async function(input,init){
-  const url=typeof input==='string'?input:input.url;
-  if(!url.endsWith('/api/ask/stream')) return originalFetch.apply(this,arguments);
-  let request={};try{request=JSON.parse((init&&init.body)||'{}')}catch{}
-  let beforeHits=0;try{beforeHits=(await (await originalFetch('/api/cache/stats')).json()).retrieval_cache_hits||0}catch{}
-  const response=await originalFetch.apply(this,arguments);
-  const clone=response.clone();
-  (async()=>{
-    try{
-      const reader=clone.body.getReader(),decoder=new TextDecoder();let buf='';
-      while(true){const {value,done}=await reader.read();if(done)break;buf+=decoder.decode(value,{stream:true});
-        const blocks=buf.split('\n\n');buf=blocks.pop()||'';
-        for(const block of blocks){if(!block.includes('event: result'))continue;const line=block.split('\n').find(x=>x.startsWith('data:'));if(!line)continue;
-          const result=JSON.parse(line.slice(5).trim());
-          let afterHits=beforeHits;try{afterHits=(await (await originalFetch('/api/cache/stats')).json()).retrieval_cache_hits||beforeHits}catch{}
-          const cacheHit=afterHits>beforeHits;
-          await originalFetch('/api/traces',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...result,cache_hit:cacheHit})});
-          const answerBox=document.getElementById('answer');if(answerBox&&result.answer){
-            const old=document.getElementById('feedbackBar');if(old)old.remove();
-            const bar=document.createElement('div');bar.id='feedbackBar';bar.style='display:flex;gap:8px;margin-top:10px;align-items:center';
-            bar.innerHTML='<span style="color:#7f8ca4;font-size:11px">Was this answer useful?</span><button id="fbUp" class="mini">👍 Helpful</button><button id="fbDown" class="mini">👎 Not helpful</button>';
-            answerBox.appendChild(bar);
-            async function sendFeedback(rating){await originalFetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:request.question,answer:result.answer,rating,document_ids:result.scope_document_ids||[],mode:result.mode})});bar.innerHTML='<span style="color:#50d8a2;font-size:11px">Feedback recorded.</span>'}
-            document.getElementById('fbUp').onclick=()=>sendFeedback(1);document.getElementById('fbDown').onclick=()=>sendFeedback(-1);
-          }
-        }
-      }
-    }catch(e){console.debug('enterprise trace hook',e)}
-    enterpriseTelemetry();
-  })();
-  return response;
+ const url=typeof input==='string'?input:input.url;
+ if(!url.endsWith('/api/ask/stream')) return originalFetch.apply(this,arguments);
+ let request={};try{request=JSON.parse((init&&init.body)||'{}')}catch{}
+ let beforeHits=0;try{beforeHits=(await (await originalFetch('/api/cache/stats')).json()).retrieval_cache_hits||0}catch{}
+ const response=await originalFetch.apply(this,arguments);const clone=response.clone();
+ (async()=>{try{const reader=clone.body.getReader();const decoder=new TextDecoder();let buf='',result=null;for(;;){const {value,done}=await reader.read();if(done)break;buf+=decoder.decode(value,{stream:true});const blocks=buf.split('\n\n');buf=blocks.pop()||'';for(const block of blocks){const line=block.split('\n').find(x=>x.startsWith('data:'));if(!line)continue;try{const data=JSON.parse(line.slice(5).trim());if(block.startsWith('event: result'))result=data}catch{}}}if(result){let afterHits=beforeHits;try{afterHits=(await (await originalFetch('/api/cache/stats')).json()).retrieval_cache_hits||beforeHits}catch{}await originalFetch('/api/traces',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...result,cache_hit:afterHits>beforeHits})});enterpriseTelemetry();}}catch{}})();return response;
 };
 })();
 </script></body></html>'''
 )
+
 
 app.routes[:] = [r for r in app.routes if getattr(r, "path", None) != "/"]
 

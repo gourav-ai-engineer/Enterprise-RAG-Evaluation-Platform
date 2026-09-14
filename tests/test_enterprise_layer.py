@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-from enterprise_main import app
+from enterprise_main import app, VERSION
 
 
 def test_enterprise_overview_and_health():
@@ -8,14 +8,14 @@ def test_enterprise_overview_and_health():
         overview = client.get("/api/enterprise/overview")
         assert overview.status_code == 200
         payload = overview.json()
-        assert payload["version"] == "4.2.0"
+        assert payload["version"] == VERSION
         assert "documents" in payload
         assert "retrieval_cache_entries" in payload
         assert "retrieval_cache_hits" in payload
 
         health = client.get("/health")
         assert health.status_code == 200
-        assert health.json()["version"] == "4.2.0"
+        assert health.json()["version"] == VERSION
 
 
 def test_enterprise_root_exposes_telemetry_and_feedback_hook():
@@ -30,7 +30,6 @@ def test_enterprise_root_exposes_telemetry_and_feedback_hook():
 def test_collection_feedback_and_trace_lifecycle():
     with TestClient(app) as client:
         name = "CI Collection"
-        client.delete("/api/collections/does-not-exist")
         created = client.post("/api/collections", json={"name": name, "description": "CI test"})
         assert created.status_code in (200, 409)
         if created.status_code == 200:

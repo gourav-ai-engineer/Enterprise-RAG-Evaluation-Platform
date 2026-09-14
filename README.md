@@ -1,122 +1,136 @@
 # Enterprise RAG Evaluation Platform
 
-Production-oriented Retrieval-Augmented Generation workbench for **dynamic PDF ingestion, multi-document hybrid retrieval, reranking, grounded LLM generation, abstention, citations, latency telemetry, evaluation, and reproducible benchmarks**.
+Production-oriented Retrieval-Augmented Generation workbench for **dynamic PDF ingestion, SHA-256 deduplication, cached ingestion, multi-document hybrid retrieval, reranking, grounded Gemini/Ollama generation, abstention, citations, document lifecycle management, collections, feedback, audit logs, telemetry, evaluation, and reproducible benchmarks**.
 
-## Production query workflow
+## Current architecture
 
 ```text
-User question
-    ↓
-Document scope: selected document OR entire knowledge base
-    ↓
-Page-aware extraction + paragraph-aware overlapping chunks
-    ↓
-BM25 + TF-IDF hybrid candidate retrieval
-    ↓
-Cross-signal reranking of top candidates
-    ↓
-Evidence / answerability gate
-    ↓
-Best reranked chunks → grounded LLM
-    ↓
-Concise answer + source/page attribution
-    ↓
-Retrieval + rerank + generation + end-to-end latency telemetry
+PDF upload
+   ↓
+Validate + SHA-256 content identity
+   ↓
+Duplicate check ──→ reuse existing indexed document
+   ↓
+Content-addressed PDF + ingestion cache
+   ↓
+Page-aware extraction + overlapping chunks
+   ↓
+BM25 + TF-IDF hybrid retrieval
+   ↓
+Reranking + evidence/answerability gate
+   ↓
+Grounded Gemini streaming answer
+   ↓
+Citations + latency trace + user feedback
 ```
 
-The corpus is **not hard-coded**. Users upload PDFs through the web UI or `POST /api/documents/upload`. By default a question searches the whole indexed knowledge base; clicking **Use document** scopes the query to one document.
+The corpus is **not hard-coded**. Users upload PDFs through the web UI or `POST /api/documents/upload`.
 
-## Retrieval and generation
+## Enterprise capabilities
 
-- **Hybrid retrieval:** BM25 + TF-IDF bigram retrieval provides complementary lexical signals.
-- **Candidate expansion:** retrieves a larger candidate pool before final ranking.
-- **Reranking:** combines hybrid score, query-term coverage, phrase overlap, and query-intent signals to select the best evidence chunks.
-- **Chunking:** paragraph-aware page chunks with configurable `CHUNK_WORDS` and `CHUNK_OVERLAP` preserve page attribution while reducing oversized context.
-- **Grounded generation:** when `OPENAI_API_KEY` is configured, only reranked chunks are sent to the LLM with an explicit no-invention instruction and `[Source N]` citation format.
-- **Safe fallback:** without an LLM key, the same reranked evidence is used for a deterministic extractive answer; unsupported questions abstain.
-- **Document-aware citations:** duplicate chunks are consolidated into distinct document/page source groups.
+### Ingestion and data integrity
+- PDF MIME/extension validation, size limit and PDF magic-byte validation.
+- SHA-256 content identity means the same PDF is detected as a duplicate even when uploaded under a different filename.
+- Content-addressed storage at `data/documents/<sha256>.pdf`.
+- Ingestion cache at `data/cache/<sha256>.json` so parsing/chunking can be reused.
+- Reprocessing endpoint with document version increment.
+- Safe document deletion and cache invalidation.
+- Retrieval cache is scoped by query, chunk set and top-k so document scope cannot leak across requests.
 
-## Quality safeguards
+### Retrieval and generation
+- Hybrid BM25 + TF-IDF bigram retrieval.
+- Candidate expansion followed by intent-aware reranking.
+- Definition/method/purpose signals and table/numeric noise suppression.
+- Evidence/answerability gate with safe abstention.
+- Gemini streaming generation with strict evidence-only prompting and source IDs.
+- Optional Ollama/OpenAI-compatible workflow remains available through the underlying application modules.
+- Grouped document/page citations and exact evidence inspection.
 
-- **Answerability gate:** weak or unsupported questions abstain instead of returning an unrelated top chunk.
-- **Intent-aware extraction/reranking:** definition, method, purpose and comparison questions receive different evidence preferences.
-- **Noise suppression:** numeric/table-heavy evidence is down-ranked for normal explanatory questions.
-- **Concise answers:** fallback extraction returns at most two high-quality evidence sentences.
-- **Multi-document isolation:** explicit document selection scopes retrieval; otherwise all indexed chunks are candidates.
-- **Telemetry:** `/api/ask` exposes retrieval, reranking, generation and total latency plus candidate/context counts.
+### Knowledge operations
+- Collections with unique names and document assignment.
+- Document status, source type, version and update metadata.
+- Document quality signal based on indexed text density.
+- Reprocess/delete lifecycle actions.
+
+### Evaluation-driven operations
+- Query traces persisted to SQLite with retrieval, rerank, TTFT, generation and total latency.
+- Evidence coverage and answerability tracking.
+- 👍/👎 feedback persisted for later evaluation-set improvement.
+- Audit log for collection, document lifecycle and feedback events.
+- Live enterprise telemetry strip in the workbench.
+- `/api/enterprise/overview` exposes real operational counters; no metrics are hard-coded.
 
 ## API
 
 ### Upload
-
 `POST /api/documents/upload` with multipart field `file`.
 
-### List documents
+Response includes `sha256`, `duplicate`, `cache_hit`, page count and chunk count.
 
-`GET /api/documents`
+### Documents
+- `GET /api/documents`
+- `POST /api/documents/{id}/reprocess`
+- `DELETE /api/documents/{id}`
+- `PATCH /api/documents/{id}/collection`
 
-### Retrieve and rerank
+### Collections
+- `GET /api/collections`
+- `POST /api/collections`
 
-`GET /api/retrieve?q=<question>&document_id=<optional>&k=5`
+### Enterprise telemetry
+- `GET /api/enterprise/overview`
+- `GET /api/admin/audit-logs`
+- `POST /api/traces`
+- `POST /api/feedback`
+- `GET /health`
 
-The response includes `answerable`, `evidence_coverage`, `latency`, the reranker name, and ranked evidence chunks.
+### Retrieve / Ask / Evaluate
+The underlying APIs remain available from `main.py`/`gemini_main.py`, including document-scoped retrieval, grounded Q&A and evaluation.
 
-### Ask
+## Gemini configuration
 
-`POST /api/ask`
-
-```json
-{
-  "question": "How does the Transformer differ from BERT?",
-  "document_id": "optional-id",
-  "top_k": 5
-}
+```powershell
+$env:GEMINI_API_KEY="your-key"
+$env:GEMINI_MODEL="gemini-3.5-flash-lite"
 ```
 
-The response includes `answerable`, `evidence_coverage`, `mode`, grouped `citations`, `latency`, and the reranked evidence used to construct the answer.
+Run the complete enterprise application locally:
 
-## LLM configuration
-
-For the full retrieval → rerank → LLM workflow, configure an OpenAI-compatible endpoint:
-
-```env
-OPENAI_API_KEY=your-key
-OPENAI_BASE_URL=https://api.openai.com/v1
-LLM_MODEL=your-model
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn enterprise_main:app --reload
 ```
 
-Any compatible provider can be used by changing `OPENAI_BASE_URL` and `LLM_MODEL`.
+Open `http://127.0.0.1:8000`.
+
+## Cache diagnostics
+
+```text
+GET /api/cache/stats
+GET /api/enterprise/overview
+```
+
+The cache is intentionally outside Git and should live under persistent storage in production.
 
 ## Benchmark
 
-Run the reproducible benchmark with:
+Run the reproducible benchmark after the current retrieval/chunking implementation has been verified:
 
 ```bash
 python benchmark/benchmark.py
 ```
 
-The benchmark compares **Hybrid** with **Hybrid + Rerank** using Hit@K, Recall@K, MRR, nDCG@K, mean latency and p95 latency. It also reports separate retrieval and reranking latency. Results are generated at runtime and must be rerun after retrieval/chunking changes; no resume metric is hard-coded.
+Benchmark results must be regenerated after retrieval, chunking, reranking or answerability changes. **Do not copy old benchmark numbers into the resume.**
 
-## Regression tests
+## Tests
 
 ```bash
 pytest -q
 ```
 
-`tests/test_pipeline_v31.py` covers multi-document retrieval, definition-aware reranking, abstention, and query-intent classification. Existing answer-quality tests cover the QIS definition/noise and unsupported-email failure modes.
+## Docker
 
-## Run locally
+The production image now starts `enterprise_main:app` and includes the enterprise lifecycle/telemetry layer. Mount `/app/data` (or set `DATA_DIR`) to persistent storage in production because SQLite, uploaded PDFs and ingestion caches are stateful.
 
-```bash
-python -m venv .venv
-# Windows: .venv\\Scripts\\activate
-# Linux/macOS: source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn main:app --reload
-```
+## Roadmap aligned to the enterprise PR
 
-Open `http://127.0.0.1:8000`.
-
-## Deployment
-
-Docker now starts `main:app`. The application is suitable for Railway/Render/any Docker host. Mount `/app/data` (or set `DATA_DIR`) to persistent storage in production because uploaded PDFs and SQLite data are otherwise ephemeral.
+The current release establishes the production foundation first: integrity, caching, document lifecycle, collections, feedback, auditability and telemetry. Next layers can be added without replacing the working retrieval core: PostgreSQL/Qdrant/OpenSearch adapters, asynchronous workers, OCR, authentication/RBAC, policy-aware retrieval, RAGAS/DeepEval evaluation, Prometheus/OpenTelemetry and multi-tenant isolation.

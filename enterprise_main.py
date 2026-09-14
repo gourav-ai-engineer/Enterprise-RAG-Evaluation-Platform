@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -8,11 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException
+from fastapi.responses import HTMLResponse
+
+import gemini_main as ui
 import production_main as base
 import main as core
 
 app = base.app
-VERSION = "4.1.0"
+VERSION = "4.2.0"
 
 
 def now() -> str:
@@ -23,6 +27,7 @@ def migrate() -> None:
     conn = core.db()
     cols = {r[1] for r in conn.execute("PRAGMA table_info(documents)").fetchall()}
     for name, definition in {
+        "sha256": "TEXT",
         "status": "TEXT DEFAULT 'indexed'",
         "source_type": "TEXT DEFAULT 'upload'",
         "collection_id": "TEXT",
@@ -32,6 +37,9 @@ def migrate() -> None:
     }.items():
         if name not in cols:
             conn.execute(f"ALTER TABLE documents ADD COLUMN {name} {definition}")
+
+    conn.execute("DROP INDEX IF EXISTS ux_documents_sha256")
+
     conn.execute("""CREATE TABLE IF NOT EXISTS collections(
         id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT DEFAULT '',
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
@@ -51,19 +59,18 @@ def migrate() -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trace_time ON query_traces(created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_logs(created_at)")
 
-    # Backfill SHA-256 for legacy rows created before content-addressed ingestion.
-    # If two legacy rows resolve to the same content, keep the newest row and
-    # remove the older duplicate's chunks before the unique SHA index is applied.
     legacy = conn.execute(
         "SELECT id, stored_path, created_at FROM documents WHERE sha256 IS NULL ORDER BY created_at DESC"
     ).fetchall()
     seen_sha: dict[str, str] = {}
-    import hashlib
     for item in legacy:
         path = Path(item["stored_path"])
         if not path.exists():
             continue
-        sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        try:
+            sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            continue
         if sha in seen_sha:
             conn.execute("DELETE FROM chunks WHERE document_id=?", (item["id"],))
             conn.execute("DELETE FROM documents WHERE id=?", (item["id"],))
@@ -72,6 +79,7 @@ def migrate() -> None:
         seen_sha[sha] = item["id"]
         conn.execute("UPDATE documents SET sha256=? WHERE id=?", (sha, item["id"]))
 
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_documents_sha256 ON documents(sha256) WHERE sha256 IS NOT NULL")
     conn.execute("UPDATE documents SET status=COALESCE(status,'indexed'),version=COALESCE(version,1),updated_at=COALESCE(updated_at,created_at)")
     conn.commit()
     conn.close()
@@ -88,14 +96,27 @@ def audit(action: str, resource: str, resource_id: str | None = None, meta: dict
 
 
 def quality(row: sqlite3.Row) -> float:
-    pages, chunks = max(1, int(row["pages"] or 0)), int(row["chunks"] or 0)
+    pages = max(1, int(row["pages"] or 0))
+    chunks = int(row["chunks"] or 0)
     density = min(1.0, chunks / max(1.0, pages * 1.5))
     return round((0.7 * density + 0.3) * 100, 1)
+
+
+# Remove lower-layer endpoints that must be owned by the enterprise entrypoint.
+app.routes[:] = [
+    route for route in app.routes
+    if getattr(route, "path", None) not in {"/", "/health"}
+]
 
 
 @app.on_event("startup")
 def enterprise_startup() -> None:
     migrate()
+
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    return {"status": "ok", "service": "enterprise-rag-evaluation-platform", "version": VERSION}
 
 
 @app.get("/api/enterprise/overview")
@@ -107,11 +128,14 @@ def overview() -> dict[str, Any]:
                                SUM(answerable) answerable FROM query_traces""").fetchone()
     f = conn.execute("SELECT COUNT(*) n, SUM(rating=1) positive FROM feedback").fetchone()
     conn.close()
-    n = int(t["n"] or 0); fn = int(f["n"] or 0)
+    n = int(t["n"] or 0)
+    fn = int(f["n"] or 0)
     return {
         "version": VERSION,
-        "documents": int(d["total"] or 0), "indexed_documents": int(d["indexed"] or 0),
-        "collections": int(c), "queries": n,
+        "documents": int(d["total"] or 0),
+        "indexed_documents": int(d["indexed"] or 0),
+        "collections": int(c),
+        "queries": n,
         "answerable_rate": round((t["answerable"] or 0) / n, 4) if n else 0,
         "avg_latency_ms": round(float(t["avg_ms"] or 0), 1),
         "avg_evidence_coverage": round(float(t["coverage"] or 0), 4),
@@ -139,8 +163,10 @@ async def create_collection(payload: dict[str, Any]) -> dict[str, Any]:
     cid, stamp = uuid.uuid4().hex, now()
     conn = core.db()
     try:
-        conn.execute("INSERT INTO collections VALUES(?,?,?,?,?)",
-                     (cid, name, str(payload.get("description", "")).strip(), stamp, stamp))
+        conn.execute(
+            "INSERT INTO collections VALUES(?,?,?,?,?)",
+            (cid, name, str(payload.get("description", "")).strip(), stamp, stamp),
+        )
         conn.commit()
     except sqlite3.IntegrityError:
         conn.rollback()
@@ -156,14 +182,30 @@ async def set_collection(document_id: str, payload: dict[str, Any]) -> dict[str,
     cid = payload.get("collection_id")
     conn = core.db()
     if not conn.execute("SELECT 1 FROM documents WHERE id=?", (document_id,)).fetchone():
-        conn.close(); raise HTTPException(404, "Document not found")
+        conn.close()
+        raise HTTPException(404, "Document not found")
     if cid and not conn.execute("SELECT 1 FROM collections WHERE id=?", (cid,)).fetchone():
-        conn.close(); raise HTTPException(404, "Collection not found")
+        conn.close()
+        raise HTTPException(404, "Collection not found")
     conn.execute("UPDATE documents SET collection_id=?,updated_at=? WHERE id=?", (cid, now(), document_id))
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     base._retrieve_cache.clear()
     audit("document.collection_assign", "document", document_id, {"collection_id": cid})
     return {"document_id": document_id, "collection_id": cid}
+
+
+@app.get("/api/documents/{document_id}")
+def document_detail(document_id: str) -> dict[str, Any]:
+    conn = core.db()
+    row = conn.execute("SELECT * FROM documents WHERE id=?", (document_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(404, "Document not found")
+    item = dict(row)
+    item["quality_score"] = quality(row)
+    item["stored_file_exists"] = Path(row["stored_path"]).exists()
+    return item
 
 
 @app.post("/api/documents/{document_id}/reprocess")
@@ -171,9 +213,11 @@ def reprocess(document_id: str) -> dict[str, Any]:
     conn = core.db()
     row = conn.execute("SELECT * FROM documents WHERE id=?", (document_id,)).fetchone()
     conn.close()
-    if not row: raise HTTPException(404, "Document not found")
+    if not row:
+        raise HTTPException(404, "Document not found")
     path = Path(row["stored_path"])
-    if not path.exists(): raise HTTPException(404, "Stored PDF is missing")
+    if not path.exists():
+        raise HTTPException(404, "Stored PDF is missing")
     from pypdf import PdfReader
     try:
         pages = [core.clean_text(p.extract_text() or "") for p in PdfReader(str(path)).pages]
@@ -182,15 +226,22 @@ def reprocess(document_id: str) -> dict[str, Any]:
         raise HTTPException(400, f"Could not reprocess PDF: {exc}") from exc
     conn = core.db()
     conn.execute("DELETE FROM chunks WHERE document_id=?", (document_id,))
-    conn.executemany("INSERT INTO chunks(id,document_id,filename,page_start,page_end,text) VALUES(?,?,?,?,?,?)",
-                     [(uuid.uuid4().hex, document_id, row["filename"], s,e,t) for s,e,t in chunks])
-    conn.execute("UPDATE documents SET pages=?,chunks=?,version=COALESCE(version,1)+1,status='indexed',updated_at=? WHERE id=?",
-                 (len(pages), len(chunks), now(), document_id))
-    conn.commit(); conn.close()
-    if row["sha256"]: base.save_chunk_cache(row["sha256"], row["filename"], len(pages), chunks)
+    conn.executemany(
+        "INSERT INTO chunks(id,document_id,filename,page_start,page_end,text) VALUES(?,?,?,?,?,?)",
+        [(uuid.uuid4().hex, document_id, row["filename"], s, e, t) for s, e, t in chunks],
+    )
+    new_version = int(row["version"] or 1) + 1
+    conn.execute(
+        "UPDATE documents SET pages=?,chunks=?,version=?,status='indexed',updated_at=? WHERE id=?",
+        (len(pages), len(chunks), new_version, now(), document_id),
+    )
+    conn.commit()
+    conn.close()
+    if row["sha256"]:
+        base.save_chunk_cache(row["sha256"], row["filename"], len(pages), chunks)
     base._retrieve_cache.clear()
-    audit("document.reprocess", "document", document_id, {"pages": len(pages), "chunks": len(chunks)})
-    return {"document_id": document_id, "pages": len(pages), "chunks": len(chunks), "version": int(row["version"] or 1)+1}
+    audit("document.reprocess", "document", document_id, {"pages": len(pages), "chunks": len(chunks), "version": new_version})
+    return {"document_id": document_id, "pages": len(pages), "chunks": len(chunks), "version": new_version}
 
 
 @app.delete("/api/documents/{document_id}")
@@ -198,12 +249,15 @@ def delete_document(document_id: str) -> dict[str, Any]:
     conn = core.db()
     row = conn.execute("SELECT * FROM documents WHERE id=?", (document_id,)).fetchone()
     if not row:
-        conn.close(); raise HTTPException(404, "Document not found")
+        conn.close()
+        raise HTTPException(404, "Document not found")
     conn.execute("DELETE FROM chunks WHERE document_id=?", (document_id,))
     conn.execute("DELETE FROM documents WHERE id=?", (document_id,))
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     Path(row["stored_path"]).unlink(missing_ok=True)
-    if row["sha256"]: base.cache_path(row["sha256"]).unlink(missing_ok=True)
+    if row["sha256"]:
+        base.cache_path(row["sha256"]).unlink(missing_ok=True)
     base._retrieve_cache.clear()
     audit("document.delete", "document", document_id, {"filename": row["filename"]})
     return {"deleted": True, "document_id": document_id}
@@ -211,30 +265,54 @@ def delete_document(document_id: str) -> dict[str, Any]:
 
 @app.post("/api/feedback")
 async def feedback(payload: dict[str, Any]) -> dict[str, Any]:
-    q, a, rating = str(payload.get("question", "")).strip(), str(payload.get("answer", "")).strip(), int(payload.get("rating", 0))
+    q = str(payload.get("question", "")).strip()
+    a = str(payload.get("answer", "")).strip()
+    try:
+        rating = int(payload.get("rating", 0))
+    except (TypeError, ValueError):
+        rating = 0
     if not q or not a or rating not in (-1, 1):
         raise HTTPException(400, "question, answer and rating (-1 or 1) are required")
     fid = uuid.uuid4().hex
     conn = core.db()
-    conn.execute("INSERT INTO feedback VALUES(?,?,?,?,?,?,?)",
-                 (fid, q, a, rating, json.dumps(payload.get("document_ids") or []), payload.get("mode"), now()))
-    conn.commit(); conn.close()
+    conn.execute(
+        "INSERT INTO feedback VALUES(?,?,?,?,?,?,?)",
+        (fid, q, a, rating, json.dumps(payload.get("document_ids") or []), payload.get("mode"), now()),
+    )
+    conn.commit()
+    conn.close()
     audit("feedback.submit", "answer", fid, {"rating": rating})
     return {"id": fid, "saved": True}
 
 
 @app.post("/api/traces")
 async def trace(payload: dict[str, Any]) -> dict[str, Any]:
-    lat = payload.get("latency") or {}; tid = uuid.uuid4().hex
+    lat = payload.get("latency") or {}
+    tid = uuid.uuid4().hex
     conn = core.db()
-    conn.execute("INSERT INTO query_traces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (tid, str(payload.get("question", ""))[:2000], json.dumps(payload.get("scope_document_ids") or []),
-         payload.get("mode"), payload.get("model"), int(bool(payload.get("answerable"))),
-         float(payload.get("evidence_coverage") or 0), float(lat.get("retrieval_ms") or 0),
-         float(lat.get("rerank_ms") or 0), float(lat.get("generation_ms") or 0), float(lat.get("ttft_ms") or 0),
-         float(lat.get("total_ms") or 0), int(lat.get("candidate_count") or 0), int(lat.get("context_chunks") or 0),
-         int(bool(payload.get("cache_hit"))), now()))
-    conn.commit(); conn.close()
+    conn.execute(
+        "INSERT INTO query_traces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            tid,
+            str(payload.get("question", ""))[:2000],
+            json.dumps(payload.get("scope_document_ids") or []),
+            payload.get("mode"),
+            payload.get("model"),
+            int(bool(payload.get("answerable"))),
+            float(payload.get("evidence_coverage") or 0),
+            float(lat.get("retrieval_ms") or 0),
+            float(lat.get("rerank_ms") or 0),
+            float(lat.get("generation_ms") or 0),
+            float(lat.get("ttft_ms") or 0),
+            float(lat.get("total_ms") or 0),
+            int(lat.get("candidate_count") or 0),
+            int(lat.get("context_chunks") or 0),
+            int(bool(payload.get("cache_hit"))),
+            now(),
+        ),
+    )
+    conn.commit()
+    conn.close()
     return {"id": tid, "saved": True}
 
 
@@ -249,8 +327,9 @@ def audit_logs(limit: int = 50) -> dict[str, Any]:
 
 migrate()
 
-# Add a compact live enterprise telemetry strip without duplicating the full UI.
-ENTERPRISE_HTML = base.HTML.replace(
+# Reuse the working Gemini UI. The previous implementation referenced
+# production_main.HTML, but the HTML is owned by gemini_main.
+ENTERPRISE_HTML = ui.HTML.replace(
     '<main class="main">',
     '<main class="main"><section id="enterpriseBar" style="margin-bottom:14px;border:1px solid #223049;background:#0d1624;border-radius:12px;padding:12px 14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
     '<b style="font-size:12px">Enterprise telemetry</b>'
@@ -258,6 +337,7 @@ ENTERPRISE_HTML = base.HTML.replace(
     '<span id="eQueries" style="color:#8b99ad;font-size:11px">Queries —</span>'
     '<span id="eCoverage" style="color:#8b99ad;font-size:11px">Evidence —</span>'
     '<span id="eLatency" style="color:#8b99ad;font-size:11px">Latency —</span>'
+    '<span id="eCache" style="color:#8b99ad;font-size:11px">Cache —</span>'
     '<a href="/docs" target="_blank" style="margin-left:auto;border:1px solid #223049;background:#101b2b;color:#d4deed;padding:6px 9px;border-radius:7px;text-decoration:none;font-size:11px">API</a>'
     '</section>'
 )
@@ -267,9 +347,11 @@ ENTERPRISE_HTML = ENTERPRISE_HTML.replace(
     'document.getElementById("eDocs").textContent=`Docs ${d.indexed_documents}/${d.documents}`;'
     'document.getElementById("eQueries").textContent=`Queries ${d.queries}`;'
     'document.getElementById("eCoverage").textContent=`Evidence ${(d.avg_evidence_coverage*100).toFixed(0)}%`;'
-    'document.getElementById("eLatency").textContent=`Avg ${d.avg_latency_ms.toFixed(0)} ms`;}catch{}}'
+    'document.getElementById("eLatency").textContent=`Avg ${d.avg_latency_ms.toFixed(0)} ms`;'
+    'document.getElementById("eCache").textContent=`Cache ${d.retrieval_cache_entries}R · ${d.ingestion_cache_entries}I`;}catch{}}'
     'enterpriseTelemetry();setInterval(enterpriseTelemetry,15000);</script></body></html>'
 )
+
 app.routes[:] = [r for r in app.routes if getattr(r, "path", None) != "/"]
 
 

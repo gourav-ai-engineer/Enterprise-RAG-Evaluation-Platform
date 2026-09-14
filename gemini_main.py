@@ -97,13 +97,16 @@ def build_prompt(question: str, results: list[dict]) -> tuple[str, str]:
         for group in groups
     )
     system = (
-        "You are the generation layer of a grounded enterprise RAG system. "
-        "Answer ONLY from the supplied evidence. Do not use outside knowledge. "
-        "Return only the final answer, never reasoning or analysis. "
-        "Do not say 'let me analyze', 'from the evidence', or describe your process. "
-        "Be concise: normally 1-3 sentences. Preserve important equations or terms when needed. "
-        "Cite factual claims using [Source N], where N is the source number provided. "
-        "If the evidence does not support the answer, state that the evidence is insufficient."
+        "You are the final answer layer of a grounded enterprise RAG system. "
+        "Answer ONLY from the supplied evidence. Never use outside knowledge. "
+        "Return only the final answer, never reasoning, analysis, planning, or process commentary. "
+        "Answer the exact question directly in 1-3 COMPLETE sentences, normally under 90 words. "
+        "Finish the final sentence; never stop at an unfinished clause. "
+        "Cite factual claims with [Source N], using only source numbers present below. "
+        "For mathematical notation, use readable Unicode/plain text: α, β, γ, ρᵢ, ρ̄. "
+        "NEVER output LaTeX delimiters ($, $$, \\(, \\), \\[ or \\]) or raw commands such as \\alpha. "
+        "If an equation is needed, write it plainly, e.g. QIS = αI(ρᵢ) + βQJSD(ρᵢ) − γF(ρᵢ, ρ̄). "
+        "If the supplied evidence is insufficient, say so clearly instead of guessing."
     )
     return system, f"Question: {question}\n\nRetrieved evidence:\n{context}"
 
@@ -120,6 +123,33 @@ def compact_citations(results: list[dict]) -> list[dict]:
     ]
 
 
+def clean_answer(answer: str) -> str:
+    """Normalize common LaTeX leakage from model output for the UI."""
+    text = answer.strip()
+    text = text.replace("$$", "").replace("$", "")
+    text = text.replace("\\(", "").replace("\\)", "")
+    text = text.replace("\\[", "").replace("\\]", "")
+    replacements = {
+        r"\\alpha": "α", r"\\beta": "β", r"\\gamma": "γ",
+        r"\\delta": "δ", r"\\epsilon": "ε", r"\\theta": "θ",
+        r"\\lambda": "λ", r"\\mu": "μ", r"\\rho": "ρ",
+        r"\\sigma": "σ", r"\\tau": "τ", r"\\phi": "φ",
+        r"\\psi": "ψ", r"\\omega": "ω",
+        r"\\infty": "∞", r"\\pm": "±", r"\\times": "×",
+        r"\\cdot": "·", r"\\leq": "≤", r"\\geq": "≥",
+    }
+    for pattern, replacement in replacements.items():
+        text = re.sub(pattern, replacement, text)
+    text = re.sub(r"\\(?:text|mathrm|mathbf|mathit)\{([^{}]*)\}", r"\1", text)
+    text = re.sub(r"\\bar\{([^{}]*)\}", r"\1̄", text)
+    text = re.sub(r"\\hat\{([^{}]*)\}", r"\1̂", text)
+    # Convert common underscore subscripts into Unicode for simple identifiers.
+    subs = str.maketrans("0123456789+-=()", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎")
+    text = re.sub(r"([A-Za-zα-ωΑ-Ω])_([0-9+\-=()]+)", lambda m: m.group(1) + m.group(2).translate(subs), text)
+    text = re.sub(r"\s+([,.;:])", r"\1", text)
+    return text.strip()
+
+
 async def gemini_stream_generate(model: str, question: str, results: list[dict]) -> tuple[str, float, float, int]:
     key = gemini_key()
     if not key:
@@ -129,7 +159,8 @@ async def gemini_stream_generate(model: str, question: str, results: list[dict])
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": [{"role": "user", "parts": [{"text": user}]}],
         "generationConfig": {
-            "maxOutputTokens": 128,
+            "maxOutputTokens": 256,
+            "temperature": 0.0,
             "thinkingConfig": {"thinkingLevel": "minimal"},
         },
     }
@@ -137,6 +168,7 @@ async def gemini_stream_generate(model: str, question: str, results: list[dict])
     ttft_ms = 0.0
     chunks = 0
     pieces: list[str] = []
+    finish_reason = None
     timeout = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream(
@@ -157,7 +189,9 @@ async def gemini_stream_generate(model: str, question: str, results: list[dict])
                 candidates = data.get("candidates") or []
                 if not candidates:
                     continue
-                content = candidates[0].get("content") or {}
+                candidate = candidates[0]
+                finish_reason = candidate.get("finishReason") or finish_reason
+                content = candidate.get("content") or {}
                 for part in content.get("parts") or []:
                     text = part.get("text") or ""
                     if not text:
@@ -167,9 +201,11 @@ async def gemini_stream_generate(model: str, question: str, results: list[dict])
                     pieces.append(text)
                     chunks += 1
     generation_ms = (time.perf_counter() - started) * 1000
-    answer = "".join(pieces).strip()
+    answer = clean_answer("".join(pieces))
     if not answer:
         raise RuntimeError("Gemini returned an empty answer")
+    if finish_reason == "MAX_TOKENS":
+        raise RuntimeError("Gemini reached the output limit; answer was incomplete")
     return answer, ttft_ms, generation_ms, chunks
 
 

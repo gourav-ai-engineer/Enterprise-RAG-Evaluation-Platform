@@ -1,6 +1,6 @@
 # Enterprise RAG Evaluation Platform
 
-Production-oriented Retrieval-Augmented Generation workbench for **dynamic PDF ingestion, SHA-256 deduplication, cached ingestion, multi-document hybrid retrieval, reranking, grounded Gemini/Ollama generation, abstention, citations, document lifecycle management, collections, feedback, audit logs, telemetry, evaluation, and reproducible benchmarks**.
+Production-oriented Retrieval-Augmented Generation workbench for **dynamic document ingestion, SHA-256 deduplication, cached ingestion, multi-document hybrid retrieval, reranking, grounded Gemini/Ollama generation, abstention, citations, document lifecycle management, collections, feedback, audit logs, telemetry, evaluation, and reproducible benchmarks**.
 
 ## Current architecture
 
@@ -33,6 +33,7 @@ The corpus is **not hard-coded**. Users upload PDFs through the web UI or `POST 
 - SHA-256 content identity means the same PDF is detected as a duplicate even when uploaded under a different filename.
 - Content-addressed storage at `data/documents/<sha256>.pdf`.
 - Ingestion cache at `data/cache/<sha256>.json` so parsing/chunking can be reused.
+- Legacy SHA migration removes duplicate legacy rows before rebuilding the unique SHA index.
 - Reprocessing endpoint with document version increment.
 - Safe document deletion and cache invalidation.
 - Retrieval cache is scoped by query, chunk set and top-k so document scope cannot leak across requests.
@@ -48,9 +49,9 @@ The corpus is **not hard-coded**. Users upload PDFs through the web UI or `POST 
 
 ### Knowledge operations
 - Collections with unique names and document assignment.
-- Document status, source type, version and update metadata.
-- Document quality signal based on indexed text density.
+- Document detail endpoint with status, source type, version, update metadata and quality signal.
 - Reprocess/delete lifecycle actions.
+- Stored-file existence diagnostics.
 
 ### Evaluation-driven operations
 - Query traces persisted to SQLite with retrieval, rerank, TTFT, generation and total latency.
@@ -69,6 +70,7 @@ Response includes `sha256`, `duplicate`, `cache_hit`, page count and chunk count
 
 ### Documents
 - `GET /api/documents`
+- `GET /api/documents/{id}`
 - `POST /api/documents/{id}/reprocess`
 - `DELETE /api/documents/{id}`
 - `PATCH /api/documents/{id}/collection`
@@ -82,10 +84,11 @@ Response includes `sha256`, `duplicate`, `cache_hit`, page count and chunk count
 - `GET /api/admin/audit-logs`
 - `POST /api/traces`
 - `POST /api/feedback`
+- `GET /api/cache/stats`
 - `GET /health`
 
 ### Retrieve / Ask / Evaluate
-The underlying APIs remain available from `main.py`/`gemini_main.py`, including document-scoped retrieval, grounded Q&A and evaluation.
+The underlying retrieval, grounded Q&A and evaluation APIs remain available through the composed application stack.
 
 ## Gemini configuration
 
@@ -97,6 +100,7 @@ $env:GEMINI_MODEL="gemini-3.5-flash-lite"
 Run the complete enterprise application locally:
 
 ```powershell
+.\.venv\Scripts\python.exe -m py_compile enterprise_main.py
 .\.venv\Scripts\python.exe -m uvicorn enterprise_main:app --reload
 ```
 
@@ -113,13 +117,13 @@ The cache is intentionally outside Git and should live under persistent storage 
 
 ## Benchmark
 
-Run the reproducible benchmark after the current retrieval/chunking implementation has been verified:
+Run the reproducible benchmark only after the current upload, deduplication, cache and query path has been verified:
 
 ```bash
 python benchmark/benchmark.py
 ```
 
-Benchmark results must be regenerated after retrieval, chunking, reranking or answerability changes. **Do not copy old benchmark numbers into the resume.**
+Benchmark results must be regenerated after retrieval, chunking, reranking, caching or answerability changes. **Do not copy old benchmark numbers into the resume.**
 
 ## Tests
 
@@ -129,8 +133,21 @@ pytest -q
 
 ## Docker
 
-The production image now starts `enterprise_main:app` and includes the enterprise lifecycle/telemetry layer. Mount `/app/data` (or set `DATA_DIR`) to persistent storage in production because SQLite, uploaded PDFs and ingestion caches are stateful.
+The production image starts `enterprise_main:app` and includes the enterprise lifecycle/telemetry layer. Mount `/app/data` (or set `DATA_DIR`) to persistent storage in production because SQLite, uploaded PDFs and ingestion caches are stateful.
 
 ## Roadmap aligned to the enterprise PR
 
-The current release establishes the production foundation first: integrity, caching, document lifecycle, collections, feedback, auditability and telemetry. Next layers can be added without replacing the working retrieval core: PostgreSQL/Qdrant/OpenSearch adapters, asynchronous workers, OCR, authentication/RBAC, policy-aware retrieval, RAGAS/DeepEval evaluation, Prometheus/OpenTelemetry and multi-tenant isolation.
+The current release establishes a tested production foundation first: content integrity, caching, document lifecycle, collections, feedback, auditability and telemetry. The next implementation layers should be delivered incrementally with integration tests:
+
+1. semantic embeddings + Qdrant/pgvector adapter
+2. OpenSearch BM25 adapter for large corpora
+3. asynchronous Redis/Celery ingestion
+4. Docling/Tesseract OCR pipeline
+5. MinIO object-storage adapter
+6. Keycloak/OIDC authentication and RBAC
+7. policy-aware retrieval and tenant isolation
+8. RAGAS/DeepEval regression suite
+9. OpenTelemetry + Prometheus/Grafana
+10. multi-model routing and production load testing
+
+These components are **not claimed as implemented until they are actually integrated and tested**.

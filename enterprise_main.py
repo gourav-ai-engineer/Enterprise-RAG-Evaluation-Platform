@@ -50,6 +50,28 @@ def migrate() -> None:
         resource_id TEXT, metadata TEXT NOT NULL, created_at TEXT NOT NULL)""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trace_time ON query_traces(created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_logs(created_at)")
+
+    # Backfill SHA-256 for legacy rows created before content-addressed ingestion.
+    # If two legacy rows resolve to the same content, keep the newest row and
+    # remove the older duplicate's chunks before the unique SHA index is applied.
+    legacy = conn.execute(
+        "SELECT id, stored_path, created_at FROM documents WHERE sha256 IS NULL ORDER BY created_at DESC"
+    ).fetchall()
+    seen_sha: dict[str, str] = {}
+    import hashlib
+    for item in legacy:
+        path = Path(item["stored_path"])
+        if not path.exists():
+            continue
+        sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        if sha in seen_sha:
+            conn.execute("DELETE FROM chunks WHERE document_id=?", (item["id"],))
+            conn.execute("DELETE FROM documents WHERE id=?", (item["id"],))
+            path.unlink(missing_ok=True)
+            continue
+        seen_sha[sha] = item["id"]
+        conn.execute("UPDATE documents SET sha256=? WHERE id=?", (sha, item["id"]))
+
     conn.execute("UPDATE documents SET status=COALESCE(status,'indexed'),version=COALESCE(version,1),updated_at=COALESCE(updated_at,created_at)")
     conn.commit()
     conn.close()
@@ -161,7 +183,7 @@ def reprocess(document_id: str) -> dict[str, Any]:
     conn = core.db()
     conn.execute("DELETE FROM chunks WHERE document_id=?", (document_id,))
     conn.executemany("INSERT INTO chunks(id,document_id,filename,page_start,page_end,text) VALUES(?,?,?,?,?,?)",
-                     [(uuid.uuid4().hex, document_id, row["filename"], s, e, t) for s,e,t in chunks])
+                     [(uuid.uuid4().hex, document_id, row["filename"], s,e,t) for s,e,t in chunks])
     conn.execute("UPDATE documents SET pages=?,chunks=?,version=COALESCE(version,1)+1,status='indexed',updated_at=? WHERE id=?",
                  (len(pages), len(chunks), now(), document_id))
     conn.commit(); conn.close()

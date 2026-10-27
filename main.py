@@ -312,12 +312,12 @@ def intent(question: str) -> str:
     q = question.lower()
     if re.search(r"\b(what is|what are|define|definition)\b", q):
         return "definition"
-    if re.search(r"\b(how|calculate|formula|computed)\b", q):
-        return "method"
+    if re.search(r"\b(differ|difference|compare|versus|vs\.)\b", q):
+        return "comparison"
     if re.search(r"\b(why|purpose|reason)\b", q):
         return "purpose"
-    if re.search(r"\b(differ|difference|compare|versus|vs\\.)\b", q):
-        return "comparison"
+    if re.search(r"\b(how|calculate|formula|computed)\b", q):
+        return "method"
     return "general"
 
 

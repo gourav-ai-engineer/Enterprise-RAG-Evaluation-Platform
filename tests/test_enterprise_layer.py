@@ -18,13 +18,15 @@ def test_enterprise_overview_and_health():
         assert health.json()["version"] == VERSION
 
 
-def test_enterprise_root_exposes_telemetry_and_feedback_hook():
+def test_enterprise_root_exposes_telemetry_and_feedback_endpoint():
     with TestClient(app) as client:
         response = client.get("/")
         assert response.status_code == 200
         assert "Enterprise telemetry" in response.text
-        assert "/api/traces" in response.text
-        assert "/api/feedback" in response.text
+        # These server-side APIs are listed by the app's OpenAPI schema.
+        schema = client.get("/openapi.json").json()
+        assert "/api/traces" in schema["paths"]
+        assert "/api/feedback" in schema["paths"]
 
 
 def test_collection_feedback_and_trace_lifecycle():

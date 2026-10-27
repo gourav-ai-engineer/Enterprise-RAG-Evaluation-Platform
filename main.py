@@ -286,3 +286,51 @@ HTML=r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="
 
 @app.get("/", response_class=HTMLResponse)
 def home()->str: return HTML
+
+# Backwards-compatible aliases for the v3.1 evaluation tests and examples.
+# The current public API uses the more explicit function names above.
+ABSTAIN = ABSTAIN_MESSAGE
+
+
+def answerable(question: str, results: list[dict[str, Any]]) -> bool:
+    """Compatibility alias for evidence sufficiency checks."""
+    return has_sufficient_evidence(question, results)
+
+
+def coverage(question: str, results: list[dict[str, Any]]) -> float:
+    """Compatibility alias for question-term evidence coverage."""
+    return evidence_coverage(question, results)
+
+
+def extractive(question: str, results: list[dict[str, Any]]) -> str:
+    """Compatibility alias for the current extractive answer generator."""
+    return extractive_answer(question, results)
+
+
+def intent(question: str) -> str:
+    """Classify the broad intent of a question for older evaluation examples."""
+    q = question.lower()
+    if re.search(r"\\b(what is|what are|define|definition)\\b", q):
+        return "definition"
+    if re.search(r"\\b(how|calculate|formula|computed)\\b", q):
+        return "method"
+    if re.search(r"\\b(why|purpose|reason)\\b", q):
+        return "purpose"
+    if re.search(r"\\b(differ|difference|compare|versus|vs\\.)\\b", q):
+        return "comparison"
+    return "general"
+
+
+def retrieve(question: str, rows: list[dict[str, Any]], k: int) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    """Run the current hybrid retrieval and reranking pipeline on supplied chunks."""
+    started = time.perf_counter()
+    candidates = hybrid_retrieve(question, rows, max(k, RETRIEVAL_CANDIDATES))
+    retrieval_ms = (time.perf_counter() - started) * 1000
+    rerank_started = time.perf_counter()
+    results = rerank(question, candidates, k)
+    rerank_ms = (time.perf_counter() - rerank_started) * 1000
+    return results, {
+        "retrieval_ms": round(retrieval_ms, 2),
+        "rerank_ms": round(rerank_ms, 2),
+        "total_ms": round(retrieval_ms + rerank_ms, 2),
+    }

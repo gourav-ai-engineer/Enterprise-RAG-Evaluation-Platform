@@ -246,9 +246,9 @@ async def gemini_stream_generate_with_fallback(
     generation_started = time.perf_counter()
     first_token_ms: float | None = None
 
-    budget_seconds = max(8.0, float(os.getenv("GEMINI_GENERATION_BUDGET_SECONDS", "35")))
-    request_timeout = max(1.0, float(os.getenv("GEMINI_REQUEST_TIMEOUT_SECONDS", "14")))
-    first_token_timeout = max(0.5, float(os.getenv("GEMINI_FIRST_TOKEN_TIMEOUT_SECONDS", "6")))
+    budget_seconds = max(8.0, float(os.getenv("GEMINI_GENERATION_BUDGET_SECONDS", "25")))
+    request_timeout = max(1.0, float(os.getenv("GEMINI_REQUEST_TIMEOUT_SECONDS", "10")))
+    first_token_timeout = max(0.5, float(os.getenv("GEMINI_FIRST_TOKEN_TIMEOUT_SECONDS", "4")))
     deadline = time.monotonic() + budget_seconds
 
     for model_index, candidate_model in enumerate(models):

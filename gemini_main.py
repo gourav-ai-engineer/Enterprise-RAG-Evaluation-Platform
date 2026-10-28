@@ -135,6 +135,52 @@ def compact_citations(results: list[dict]) -> list[dict]:
     ]
 
 
+FAST_FACTUAL_PATTERN = re.compile(
+    r"^(?:who\s+(?:is|was|are|were)|what\s+(?:is|are|was|were)|"
+    r"where\s+(?:is|are|was|were)|when\s+(?:is|are|was|were|did|does)|"
+    r"which\b|how many\b|how much\b|name\b|list\b)",
+    re.IGNORECASE,
+)
+FAST_COMPLEX_PATTERN = re.compile(
+    r"\b(?:why|explain|compare|comparison|difference|summari[sz]e|"
+    r"advantages|disadvantages|pros|cons|architecture|step by step|how does|how do)\b",
+    re.IGNORECASE,
+)
+
+
+def fast_extractive_answer(question: str, results: list[dict]) -> str | None:
+    """Answer simple factual lookups from retrieved sentences without a model call."""
+    if not FAST_FACTUAL_PATTERN.match(question.strip()):
+        return None
+    if FAST_COMPLEX_PATTERN.search(question) or len(core.content_tokens(question)) > 7:
+        return None
+
+    answer = core.extractive_answer(question, results)
+    if not answer or answer == core.ABSTAIN_MESSAGE or len(answer.split()) > 85:
+        return None
+
+    groups = evidence_groups(results)
+    source_id_by_filename = {group["filename"]: group["source_id"] for group in groups}
+    sentences = [
+        core.clean_text(item)
+        for item in re.split(r"(?<=[.!?])\s+", answer)
+        if item.strip()
+    ]
+    cited_sentences = []
+    for sentence in sentences:
+        source_id = None
+        for item in results:
+            if sentence.casefold() in core.clean_text(item["text"]).casefold():
+                source_id = source_id_by_filename.get(item["filename"])
+                if source_id is not None:
+                    break
+        # If the exact sentence cannot be traced to a retrieved passage, use Gemini instead.
+        if source_id is None:
+            return None
+        cited_sentences.append(f"{sentence} [Source {source_id}]")
+    return " ".join(cited_sentences) if cited_sentences else None
+
+
 def clean_answer(answer: str) -> str:
     """Normalize common LaTeX leakage from model output for the UI."""
     text = answer.strip()
@@ -331,54 +377,68 @@ async def ask_stream(body: StreamAskRequest):
                 mode = "abstain"
                 yield sse("stage", {"id": "generation", "label": "Grounding guard", "detail": "Evidence threshold not met · Gemini generation skipped", "done": True})
             else:
-                yield sse("stage", {"id": "generation", "label": "Generating grounded answer", "detail": f"Gemini · {model} · streaming response", "active": True})
-                gen_started = time.perf_counter()
-                token_events: asyncio.Queue[str] = asyncio.Queue()
-
-                async def enqueue_text(piece: str) -> None:
-                    await token_events.put(sse("token", {"text": piece}))
-
-                async def reset_partial_answer(next_model: str) -> None:
-                    await token_events.put(sse("generation_reset", {"model": next_model}))
-                    await token_events.put(sse("stage", {
+                fast_answer = fast_extractive_answer(body.question, results)
+                if fast_answer:
+                    answer = fast_answer
+                    mode = "extractive_fast"
+                    model_used = None
+                    generation_ms = 0.0
+                    ttft_ms = 0.0
+                    yield sse("stage", {
                         "id": "generation",
-                        "label": "Trying fallback model",
-                        "detail": f"Switching to {next_model}",
-                        "active": True,
-                    }))
+                        "label": "Fast factual answer",
+                        "detail": "Answered directly from retrieved evidence · language model skipped",
+                        "done": True,
+                    })
+                else:
+                    yield sse("stage", {"id": "generation", "label": "Generating grounded answer", "detail": f"Gemini · {model} · streaming response", "active": True})
+                    gen_started = time.perf_counter()
+                    token_events: asyncio.Queue[str] = asyncio.Queue()
 
-                generation_task = asyncio.create_task(
-                    gemini_stream_generate_with_fallback(
-                        model,
-                        body.question,
-                        results,
-                        on_text=enqueue_text,
-                        on_reset=reset_partial_answer,
+                    async def enqueue_text(piece: str) -> None:
+                        await token_events.put(sse("token", {"text": piece}))
+
+                    async def reset_partial_answer(next_model: str) -> None:
+                        await token_events.put(sse("generation_reset", {"model": next_model}))
+                        await token_events.put(sse("stage", {
+                            "id": "generation",
+                            "label": "Trying fallback model",
+                            "detail": f"Switching to {next_model}",
+                            "active": True,
+                        }))
+
+                    generation_task = asyncio.create_task(
+                        gemini_stream_generate_with_fallback(
+                            model,
+                            body.question,
+                            results,
+                            on_text=enqueue_text,
+                            on_reset=reset_partial_answer,
+                        )
                     )
-                )
-                try:
-                    while not generation_task.done() or not token_events.empty():
-                        try:
-                            event = await asyncio.wait_for(token_events.get(), timeout=0.1)
-                            yield event
-                        except asyncio.TimeoutError:
-                            continue
-                    answer, ttft_ms, generation_ms, chunks, model_used = await generation_task
-                    mode = "gemini"
-                    fallback_note = f" · model {model_used}" if model_used != model else ""
-                    yield sse("stage", {"id": "generation", "label": "Answer ready", "detail": f"Completed{fallback_note} · first token {ttft_ms:.0f} ms · generation {generation_ms:.0f} ms · {chunks} chunks", "done": True})
-                except Exception as exc:
-                    answer = f"Gemini generation failed: {str(exc)}"
-                    mode = "gemini_error"
-                    generation_ms = (time.perf_counter() - gen_started) * 1000
-                    yield sse("stage", {"id": "generation", "label": "Gemini generation failed", "detail": str(exc)[:300], "done": True, "error": True})
+                    try:
+                        while not generation_task.done() or not token_events.empty():
+                            try:
+                                event = await asyncio.wait_for(token_events.get(), timeout=0.1)
+                                yield event
+                            except asyncio.TimeoutError:
+                                continue
+                        answer, ttft_ms, generation_ms, chunks, model_used = await generation_task
+                        mode = "gemini"
+                        fallback_note = f" · model {model_used}" if model_used != model else ""
+                        yield sse("stage", {"id": "generation", "label": "Answer ready", "detail": f"Completed{fallback_note} · first token {ttft_ms:.0f} ms · generation {generation_ms:.0f} ms · {chunks} chunks", "done": True})
+                    except Exception as exc:
+                        answer = f"Gemini generation failed: {str(exc)}"
+                        mode = "gemini_error"
+                        generation_ms = (time.perf_counter() - gen_started) * 1000
+                        yield sse("stage", {"id": "generation", "label": "Gemini generation failed", "detail": str(exc)[:300], "done": True, "error": True})
             total_ms = (time.perf_counter() - total) * 1000
             payload = {
                 "question": body.question,
                 "answer": answer,
                 "mode": mode,
-                "provider": "gemini",
-                "model": model_used if answerable else None,
+                "provider": "gemini" if mode in {"gemini", "gemini_error"} else "local",
+                "model": model_used if mode == "gemini" else None,
                 "answerable": answerable,
                 "scope_document_ids": scope or [],
                 "evidence_coverage": round(core.evidence_coverage(body.question, results), 4),
@@ -402,8 +462,8 @@ async def ask_stream(body: StreamAskRequest):
 
 
 HTML = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Enterprise RAG · Workbench</title><style>
-:root{color-scheme:dark;--bg:#070c16;--panel:#0d1626;--panel2:#0a1321;--line:#263650;--line2:#344867;--text:#f4f7fb;--muted:#8d9bb2;--accent:#8290ff;--ok:#50d8a2}*{box-sizing:border-box}body{margin:0;background:radial-gradient(900px 500px at 15% -10%,#17264a,transparent 55%),var(--bg);color:var(--text);font:14px Inter,system-ui,sans-serif}.top{height:66px;border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 28px}.brand{font-weight:800}.pill{margin-left:auto;border:1px solid var(--line);padding:7px 11px;border-radius:999px;color:#b8c4d8;font-size:12px}.main{max-width:1240px;margin:auto;padding:28px}.head{display:flex;justify-content:space-between;align-items:end;margin-bottom:18px}.head h1{margin:4px 0;font-size:28px}.muted{color:var(--muted);font-size:12px}.panel{background:#0d1626e8;border:1px solid var(--line);border-radius:16px;overflow:hidden}.bar{padding:16px 18px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}.scope{margin-left:auto;border:1px solid var(--line2);background:#101b2d;color:#dce5f3;border-radius:9px;padding:9px 12px;cursor:pointer}.chat{min-height:700px;display:flex;flex-direction:column}.body{padding:22px;flex:1;display:flex;flex-direction:column}.answer{background:var(--panel2);border:1px solid #30415f;border-radius:14px;padding:18px;line-height:1.7;white-space:pre-wrap;font-size:15px}.sources{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:9px;margin-top:14px}.source{border:1px solid var(--line);padding:12px;border-radius:10px;background:var(--panel2);cursor:pointer;transition:.15s}.source:hover{border-color:#52698e;transform:translateY(-1px)}.source b{display:block;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.source .pages{font-size:10px;color:var(--muted);margin-top:5px}.source .view{font-size:10px;color:#aebaff;margin-top:9px}.composer{margin-top:auto;padding-top:18px}.box{display:flex;gap:10px;border:1px solid var(--line2);background:var(--panel2);border-radius:13px;padding:10px}.box textarea{flex:1;background:transparent;border:0;outline:0;color:white;resize:none;min-height:45px}.send{width:44px;border:0;border-radius:10px;background:linear-gradient(135deg,#718cff,#8b73e8);color:white;font-size:20px;cursor:pointer}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin-top:14px}.metric{padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--panel2)}.metric span{font-size:10px;color:#71819b}.metric b{display:block;margin-top:5px}.overlay,.modal{position:fixed;inset:0;background:rgba(3,7,14,.74);backdrop-filter:blur(7px);display:none;align-items:center;justify-content:center;z-index:20}.loader,.modalbox{width:min(650px,94vw);background:var(--panel);border:1px solid #334663;border-radius:18px;box-shadow:0 30px 90px #0008}.loader{padding:25px}.spinner{width:30px;height:30px;border:3px solid #33425c;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;margin-bottom:18px}@keyframes spin{to{transform:rotate(360deg)}}.stage{display:flex;gap:12px;padding:12px;border:1px solid transparent;border-radius:10px;color:#7f8ca4}.stage.active{border-color:#30415f;background:#101b2d;color:#eaf0f9}.stage.done{color:var(--ok)}.dot{width:9px;height:9px;border-radius:50%;background:#52627c;margin-top:5px}.active .dot{background:var(--accent);box-shadow:0 0 12px var(--accent)}.done .dot{background:var(--ok)}.modalbox{max-height:82vh;overflow:auto}.modalhead{padding:18px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between}.evidence{padding:16px 18px;border-bottom:1px solid #1e2a3f}.evidencehead{display:flex;justify-content:space-between;gap:10px}.evidence pre{white-space:pre-wrap;font:12px/1.6 Inter,system-ui,sans-serif;color:#b9c5d8;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px;margin:10px 0 0}.docrow{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid #1e2a3f}.docrow input{width:17px;height:17px}.docrow .info{flex:1}.modalfoot{padding:14px 18px;display:flex;justify-content:space-between;gap:8px;position:sticky;bottom:0;background:var(--panel);border-top:1px solid var(--line)}button{font:inherit}.mini{border:1px solid var(--line);background:#101b2d;color:#d6deeb;padding:8px 11px;border-radius:8px;cursor:pointer}.primary{border:0;background:linear-gradient(135deg,#718cff,#8b73e8);color:#fff;padding:9px 13px;border-radius:9px;cursor:pointer}@media(max-width:700px){.main{padding:14px}.metrics{grid-template-columns:1fr 1fr}.head{align-items:flex-start;gap:10px;flex-direction:column}.scope{margin-left:0}}
-</style></head><body><header class="top"><div class="brand">✦ Enterprise RAG · Workbench</div><div id="provider" class="pill">Connecting Gemini…</div></header><main class="main"><div class="head"><div><div class="muted">GROUNDED DOCUMENT INTELLIGENCE</div><h1>Ask your documents</h1><div class="muted">Hybrid retrieval → reranking → grounded generation</div></div><div><input id="file" type="file" accept="application/pdf" style="display:none"><button id="addPdfButton" class="primary" type="button">+ Add PDF</button></div></div><section class="panel chat"><div class="bar"><div><b>Document assistant</b><div id="scopeText" class="muted">Using all documents</div></div><button class="scope" onclick="openScope()"><span id="scopeBtn">All documents</span> ▾</button><button class="mini" onclick="clearChat()">Clear</button></div><div class="body"><div id="answer" class="answer" style="display:none"></div><div id="sources" class="sources"></div><div id="metrics" class="metrics" style="display:none"><div class="metric"><span>Retrieval</span><b id="mR">—</b></div><div class="metric"><span>Rerank</span><b id="mK">—</b></div><div class="metric"><span>Generation</span><b id="mG">—</b></div><div class="metric"><span>Total</span><b id="mT">—</b></div></div><div class="composer"><div class="box"><textarea id="q" placeholder="Ask a question about the selected documents…"></textarea><button class="send" onclick="ask()">↑</button></div><div class="muted">Enter to send · Shift + Enter for a new line</div></div></div></section></main><div id="overlay" class="overlay"><div class="loader"><div class="spinner"></div><h3 id="loadTitle">Preparing retrieval…</h3><div id="loadDetail" class="muted" style="margin-bottom:14px">Please wait</div><div id="stages"></div></div></div><div id="modal" class="modal"><div class="modalbox"><div class="modalhead"><div><b>Retrieval scope</b><div class="muted">Choose exactly which documents can be searched</div></div><button class="mini" onclick="closeScope()">Close</button></div><div style="padding:14px 18px;display:flex;gap:8px"><button class="mini" onclick="selectAll()">Select all</button><button class="mini" onclick="clearSelect()">Clear</button></div><div id="docs"></div><div class="modalfoot"><div id="selCount" class="muted">All documents</div><button class="primary" onclick="applyScope()">Apply scope</button></div></div></div><div id="evidenceModal" class="modal"><div class="modalbox"><div class="modalhead"><div><b id="evidenceTitle">Evidence</b><div id="evidencePages" class="muted"></div></div><button class="mini" onclick="closeEvidence()">Close</button></div><div id="evidenceBody"></div></div></div>
+:root{color-scheme:dark;--bg:#070c16;--panel:#0d1626;--panel2:#0a1321;--line:#263650;--line2:#344867;--text:#f4f7fb;--muted:#8d9bb2;--accent:#8290ff;--ok:#50d8a2}*{box-sizing:border-box}body{margin:0;background:radial-gradient(900px 500px at 15% -10%,#17264a,transparent 55%),var(--bg);color:var(--text);font:14px Inter,system-ui,sans-serif}.top{height:66px;border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 28px}.brand{font-weight:800}.pill{margin-left:auto;border:1px solid var(--line);padding:7px 11px;border-radius:999px;color:#b8c4d8;font-size:12px}.main{max-width:1240px;margin:auto;padding:28px}.head{display:flex;justify-content:space-between;align-items:end;margin-bottom:18px}.head h1{margin:4px 0;font-size:28px}.muted{color:var(--muted);font-size:12px}.panel{background:#0d1626e8;border:1px solid var(--line);border-radius:16px;overflow:hidden}.bar{padding:16px 18px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}.scope{margin-left:auto;border:1px solid var(--line2);background:#101b2d;color:#dce5f3;border-radius:9px;padding:9px 12px;cursor:pointer}.chat{min-height:700px;display:flex;flex-direction:column}.body{padding:22px;flex:1;display:flex;flex-direction:column}.answer{background:var(--panel2);border:1px solid #30415f;border-radius:14px;padding:18px;line-height:1.7;white-space:pre-wrap;font-size:15px}.sources{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:9px;margin-top:14px}.source{border:1px solid var(--line);padding:12px;border-radius:10px;background:var(--panel2);cursor:pointer;transition:.15s}.source:hover{border-color:#52698e;transform:translateY(-1px)}.source b{display:block;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.source .pages{font-size:10px;color:var(--muted);margin-top:5px}.source .view{font-size:10px;color:#aebaff;margin-top:9px}.composer{margin-top:auto;padding-top:18px}.box{display:flex;gap:10px;border:1px solid var(--line2);background:var(--panel2);border-radius:13px;padding:10px}.box textarea{flex:1;background:transparent;border:0;outline:0;color:white;resize:none;min-height:45px}.send{width:44px;border:0;border-radius:10px;background:linear-gradient(135deg,#718cff,#8b73e8);color:white;font-size:20px;cursor:pointer}.metrics{display:grid;grid-template-columns:repeat(5,1fr);gap:9px;margin-top:14px}.metric{padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--panel2)}.metric span{font-size:10px;color:#71819b}.metric b{display:block;margin-top:5px}.overlay,.modal{position:fixed;inset:0;background:rgba(3,7,14,.74);backdrop-filter:blur(7px);display:none;align-items:center;justify-content:center;z-index:20}.loader,.modalbox{width:min(650px,94vw);background:var(--panel);border:1px solid #334663;border-radius:18px;box-shadow:0 30px 90px #0008}.loader{padding:25px}.spinner{width:30px;height:30px;border:3px solid #33425c;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;margin-bottom:18px}@keyframes spin{to{transform:rotate(360deg)}}.stage{display:flex;gap:12px;padding:12px;border:1px solid transparent;border-radius:10px;color:#7f8ca4}.stage.active{border-color:#30415f;background:#101b2d;color:#eaf0f9}.stage.done{color:var(--ok)}.dot{width:9px;height:9px;border-radius:50%;background:#52627c;margin-top:5px}.active .dot{background:var(--accent);box-shadow:0 0 12px var(--accent)}.done .dot{background:var(--ok)}.modalbox{max-height:82vh;overflow:auto}.modalhead{padding:18px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between}.evidence{padding:16px 18px;border-bottom:1px solid #1e2a3f}.evidencehead{display:flex;justify-content:space-between;gap:10px}.evidence pre{white-space:pre-wrap;font:12px/1.6 Inter,system-ui,sans-serif;color:#b9c5d8;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px;margin:10px 0 0}.docrow{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid #1e2a3f}.docrow input{width:17px;height:17px}.docrow .info{flex:1}.modalfoot{padding:14px 18px;display:flex;justify-content:space-between;gap:8px;position:sticky;bottom:0;background:var(--panel);border-top:1px solid var(--line)}button{font:inherit}.mini{border:1px solid var(--line);background:#101b2d;color:#d6deeb;padding:8px 11px;border-radius:8px;cursor:pointer}.primary{border:0;background:linear-gradient(135deg,#718cff,#8b73e8);color:#fff;padding:9px 13px;border-radius:9px;cursor:pointer}@media(max-width:700px){.main{padding:14px}.metrics{grid-template-columns:1fr 1fr}.head{align-items:flex-start;gap:10px;flex-direction:column}.scope{margin-left:0}}
+</style></head><body><header class="top"><div class="brand">✦ Enterprise RAG · Workbench</div><div id="provider" class="pill">Connecting Gemini…</div></header><main class="main"><div class="head"><div><div class="muted">GROUNDED DOCUMENT INTELLIGENCE</div><h1>Ask your documents</h1><div class="muted">Hybrid retrieval → reranking → grounded generation</div></div><div><input id="file" type="file" accept="application/pdf" style="display:none"><button id="addPdfButton" class="primary" type="button">+ Add PDF</button></div></div><section class="panel chat"><div class="bar"><div><b>Document assistant</b><div id="scopeText" class="muted">Using all documents</div></div><button class="scope" onclick="openScope()"><span id="scopeBtn">All documents</span> ▾</button><button class="mini" onclick="clearChat()">Clear</button></div><div class="body"><div id="answer" class="answer" style="display:none"></div><div id="sources" class="sources"></div><div id="metrics" class="metrics" style="display:none"><div class="metric"><span>Retrieval</span><b id="mR">—</b></div><div class="metric"><span>Rerank</span><b id="mK">—</b></div><div class="metric"><span>Generation</span><b id="mG">—</b></div><div class="metric"><span>First token</span><b id="mF">—</b></div><div class="metric"><span>Total</span><b id="mT">—</b></div></div><div class="composer"><div class="box"><textarea id="q" placeholder="Ask a question about the selected documents…"></textarea><button class="send" onclick="ask()">↑</button></div><div class="muted">Enter to send · Shift + Enter for a new line</div></div></div></section></main><div id="overlay" class="overlay"><div class="loader"><div class="spinner"></div><h3 id="loadTitle">Preparing retrieval…</h3><div id="loadDetail" class="muted" style="margin-bottom:14px">Please wait</div><div id="stages"></div></div></div><div id="modal" class="modal"><div class="modalbox"><div class="modalhead"><div><b>Retrieval scope</b><div class="muted">Choose exactly which documents can be searched</div></div><button class="mini" onclick="closeScope()">Close</button></div><div style="padding:14px 18px;display:flex;gap:8px"><button class="mini" onclick="selectAll()">Select all</button><button class="mini" onclick="clearSelect()">Clear</button></div><div id="docs"></div><div class="modalfoot"><div id="selCount" class="muted">All documents</div><button class="primary" onclick="applyScope()">Apply scope</button></div></div></div><div id="evidenceModal" class="modal"><div class="modalbox"><div class="modalhead"><div><b id="evidenceTitle">Evidence</b><div id="evidencePages" class="muted"></div></div><button class="mini" onclick="closeEvidence()">Close</button></div><div id="evidenceBody"></div></div></div>
 <script>
 const $=id=>document.getElementById(id);let docs=[],selected=new Set(JSON.parse(localStorage.getItem('rag_scope')||'[]')),lastGroups=[];
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -420,8 +480,8 @@ function showEvidence(i){const g=lastGroups[i];if(!g)return;$("evidenceTitle").t
 function closeEvidence(){$("evidenceModal").style.display='none'}
 function renderSources(groups){lastGroups=groups||[];$("sources").innerHTML=lastGroups.map((g,i)=>`<button class="source" onclick="showEvidence(${i})"><b>📄 Source ${g.source_id} · ${esc(g.filename)}</b><div class="pages">Pages ${esc(g.pages)} · ${g.chunks} chunk${g.chunks>1?'s':''}</div><div class="view">View exact evidence →</div></button>`).join('')}
 function setStage(e){const id=e.id;let el=document.querySelector(`[data-stage="${id}"]`);if(!el){el=document.createElement('div');el.className='stage';el.dataset.stage=id;$("stages").appendChild(el)}el.className='stage '+(e.done?'done':e.active?'active':'');el.innerHTML=`<div class="dot"></div><div><b>${esc(e.label)}</b><div class="muted">${esc(e.detail||'')}</div></div>`;$("loadTitle").textContent=e.label;$("loadDetail").textContent=e.detail||''}
-async function ask(){const question=$("q").value.trim();if(!question)return;const ids=[...selected];$("overlay").style.display='flex';$("stages").innerHTML='';$("answer").style.display='none';$("answer").textContent='';$("sources").innerHTML='';$("metrics").style.display='none';$("provider").textContent='Preparing answer…';const body={question,document_ids:ids,top_k:3,model:null};try{const res=await fetch('/api/ask/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!res.ok)throw new Error(await res.text());const reader=res.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {value,done}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const blocks=buf.split('\n\n');buf=blocks.pop()||'';for(const block of blocks){const lines=block.split('\n');const type=(lines.find(x=>x.startsWith('event:'))||'').slice(6).trim();const raw=(lines.find(x=>x.startsWith('data:'))||'').slice(5).trim();if(!raw)continue;const data=JSON.parse(raw);if(type==='stage'){setStage(data);if(data.id==='generation')$("provider").textContent=data.label+(data.detail?' · '+data.detail:'')}if(type==='token'){$("overlay").style.display='none';$("answer").style.display='block';$("answer").textContent+=data.text}if(type==='generation_reset'){$("answer").textContent='';$("answer").style.display='none';$("overlay").style.display='flex';$("provider").textContent='Trying '+(data.model||'alternate model')+'…'}if(type==='result'){renderResult(data);$("provider").textContent=data.mode==='gemini'?'Ready · '+(data.model||'Gemini'):(data.mode==='gemini_error'?'Generation unavailable':'Ready')}if(type==='error')throw new Error(data.message)}}}catch(e){$("overlay").style.display='none';$("answer").style.display='block';$("answer").textContent='Request failed: '+e.message;$("provider").textContent='Request failed'}finally{$("overlay").style.display='none'}}
-function renderResult(d){$("answer").style.display='block';$("answer").textContent=d.answer;renderSources(d.evidence_groups||[]);const l=d.latency||{};$("metrics").style.display='grid';$("mR").textContent=(l.retrieval_ms??0).toFixed(0)+' ms';$("mK").textContent=(l.rerank_ms??0).toFixed(1)+' ms';$("mG").textContent=(l.generation_ms??0).toFixed(0)+' ms';$("mT").textContent=(l.total_ms??0).toFixed(0)+' ms'}
+async function ask(){const question=$("q").value.trim();if(!question)return;const ids=[...selected];$("overlay").style.display='flex';$("stages").innerHTML='';$("answer").style.display='none';$("answer").textContent='';$("sources").innerHTML='';$("metrics").style.display='none';$("provider").textContent='Preparing answer…';const body={question,document_ids:ids,top_k:3,model:null};try{const res=await fetch('/api/ask/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!res.ok)throw new Error(await res.text());const reader=res.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {value,done}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const blocks=buf.split('\n\n');buf=blocks.pop()||'';for(const block of blocks){const lines=block.split('\n');const type=(lines.find(x=>x.startsWith('event:'))||'').slice(6).trim();const raw=(lines.find(x=>x.startsWith('data:'))||'').slice(5).trim();if(!raw)continue;const data=JSON.parse(raw);if(type==='stage'){setStage(data);if(data.id==='generation')$("provider").textContent=data.label+(data.detail?' · '+data.detail:'')}if(type==='token'){$("overlay").style.display='none';$("answer").style.display='block';$("answer").textContent+=data.text}if(type==='generation_reset'){$("answer").textContent='';$("answer").style.display='none';$("overlay").style.display='flex';$("provider").textContent='Trying '+(data.model||'alternate model')+'…'}if(type==='result'){renderResult(data);$("provider").textContent=data.mode==='gemini'?'Ready · '+(data.model||'Gemini'):(data.mode==='extractive_fast'?'Ready · instant evidence answer':(data.mode==='gemini_error'?'Generation unavailable':'Ready'))}if(type==='error')throw new Error(data.message)}}}catch(e){$("overlay").style.display='none';$("answer").style.display='block';$("answer").textContent='Request failed: '+e.message;$("provider").textContent='Request failed'}finally{$("overlay").style.display='none'}}
+function renderResult(d){$("answer").style.display='block';$("answer").textContent=d.answer;renderSources(d.evidence_groups||[]);const l=d.latency||{};$("metrics").style.display='grid';$("mR").textContent=(l.retrieval_ms??0).toFixed(0)+' ms';$("mK").textContent=(l.rerank_ms??0).toFixed(1)+' ms';const genLabel=$("metrics").querySelector('.metric:nth-child(3) span');if(d.mode==='extractive_fast'){genLabel.textContent='Answer path';$("mG").textContent='Local';$("mF").textContent='N/A'}else{genLabel.textContent='Generation';$("mG").textContent=(l.generation_ms??0).toFixed(0)+' ms';$("mF").textContent=(l.ttft_ms??0).toFixed(0)+' ms'}$("mT").textContent=(l.total_ms??0).toFixed(0)+' ms'}
 function clearChat(){$("answer").style.display='none';$("sources").innerHTML='';$("metrics").style.display='none';lastGroups=[]}
 $("q").addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();ask()}});$("addPdfButton").addEventListener('click',()=>{$("file").click()});$("file").addEventListener('change',async e=>{const f=e.target.files[0];if(!f)return;const fd=new FormData();fd.append('file',f);$("provider").textContent='Indexing PDF…';try{const r=await fetch('/api/documents/upload',{method:'POST',body:fd});if(!r.ok)throw new Error(await r.text());await loadDocs();$("provider").textContent='PDF indexed · Gemini ready'}catch(err){alert('Upload failed: '+err.message)}e.target.value='' });loadDocs();runtime();
 </script></body></html>'''

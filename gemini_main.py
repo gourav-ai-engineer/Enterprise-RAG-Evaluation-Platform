@@ -236,7 +236,7 @@ async def gemini_stream_generate_with_fallback(
                 return answer, ttft_ms, generation_ms, chunks, candidate_model
             except Exception as exc:
                 message = str(exc)
-                match = re.search(r"Gemini HTTP (\\d{3})", message)
+                match = re.search(r"Gemini HTTP (\d{3})", message)
                 status = int(match.group(1)) if match else None
                 transient = (
                     status in {408, 429, 500, 502, 503, 504}

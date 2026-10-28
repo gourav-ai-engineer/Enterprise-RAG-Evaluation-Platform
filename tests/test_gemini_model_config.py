@@ -54,6 +54,16 @@ def test_answerable_questions_do_not_use_local_extractive_generation() -> None:
 def test_generation_timeouts_are_explicitly_bounded() -> None:
     root = Path(__file__).resolve().parents[1]
     source = (root / "gemini_main.py").read_text(encoding="utf-8")
-    assert 'GEMINI_GENERATION_BUDGET_SECONDS", "25"' in source
-    assert 'GEMINI_REQUEST_TIMEOUT_SECONDS", "10"' in source
-    assert 'GEMINI_FIRST_TOKEN_TIMEOUT_SECONDS", "4"' in source
+    assert 'GEMINI_GENERATION_BUDGET_SECONDS", "40"' in source
+    assert 'GEMINI_REQUEST_TIMEOUT_SECONDS", "28"' in source
+    assert 'GEMINI_FIRST_TOKEN_TIMEOUT_SECONDS", "12"' in source
+    assert 'GEMINI_FALLBACK_REQUEST_TIMEOUT_SECONDS", "15"' in source
+    assert 'GEMINI_FALLBACK_FIRST_TOKEN_TIMEOUT_SECONDS", "6"' in source
+
+
+
+def test_primary_and_fallback_have_different_latency_windows() -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "gemini_main.py").read_text(encoding="utf-8")
+    assert "model_first_token_timeout = first_token_timeout if model_index == 0 else fallback_first_token_timeout" in source
+    assert "model_request_timeout = request_timeout if model_index == 0 else fallback_request_timeout" in source

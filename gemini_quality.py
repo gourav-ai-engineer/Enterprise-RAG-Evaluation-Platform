@@ -70,7 +70,7 @@ async def improved_generate(
             # 128 was too small for grounded answers containing equations.
             # Keep minimal thinking for latency while allowing a complete answer.
             "maxOutputTokens": 256,
-            "thinkingConfig": {"thinkingLevel": "minimal"},
+            "thinkingConfig": {"thinkingLevel": "low"},
         },
     }
 

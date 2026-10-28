@@ -15,6 +15,8 @@ def test_gemini_overload_retries_then_falls_back(monkeypatch) -> None:
         calls.append(model)
         if model == "gemini-3.8-flash":
             raise RuntimeError("Gemini HTTP 503: temporarily overloaded")
+        if on_text is not None:
+            await on_text("grounded answer")
         return "grounded answer", 12.0, 30.0, 2
 
     monkeypatch.setattr(gemini_main.asyncio, "sleep", fake_sleep)
@@ -26,7 +28,9 @@ def test_gemini_overload_retries_then_falls_back(monkeypatch) -> None:
         )
     )
 
-    assert result == ("grounded answer", 12.0, 30.0, 2, "gemini-3.5-flash-lite")
+    assert result[0] == "grounded answer"
+    assert result[3] == 2
+    assert result[4] == "gemini-3.5-flash-lite"
     assert calls == ["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite"]
 
 

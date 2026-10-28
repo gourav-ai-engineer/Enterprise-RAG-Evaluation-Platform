@@ -58,7 +58,7 @@ The corpus is **not hard-coded**. Users upload PDFs through the web UI or `POST 
 - Evidence coverage and answerability tracking.
 - 👍/👎 feedback persisted for later evaluation-set improvement.
 - Audit log for collection, document lifecycle and feedback events.
-- Live enterprise telemetry strip in the workbench.
+- Query traces and operational telemetry remain available through API endpoints, without cluttering the main workbench.
 - `/api/enterprise/overview` exposes real operational counters; no metrics are hard-coded.
 
 ## API

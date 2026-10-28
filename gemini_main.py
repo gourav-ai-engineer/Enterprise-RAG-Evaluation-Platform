@@ -20,11 +20,20 @@ app.routes[:] = [
     if getattr(route, "path", None) not in {"/", "/api/runtime", "/api/ask/stream"}
 ]
 
-DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 GEMINI_MODELS = [
-    "gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.6-flash",
-    "gemini-3.8-flash", "gemini-2.5-flash-lite", "gemini-2.5-flash",
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
 ]
+
+
+def resolve_gemini_model(configured: str | None = None) -> str:
+    """Use a supported Gemini model, falling back from stale environment settings."""
+    requested = configured if configured is not None else os.getenv("GEMINI_MODEL")
+    return requested if requested in GEMINI_MODELS else "gemini-3.8-flash"
+
+
+DEFAULT_GEMINI_MODEL = resolve_gemini_model()
 
 
 class StreamAskRequest(BaseModel):
@@ -161,7 +170,7 @@ async def gemini_stream_generate(model: str, question: str, results: list[dict])
         "generationConfig": {
             "maxOutputTokens": 256,
             "temperature": 0.0,
-            "thinkingConfig": {"thinkingLevel": "minimal"},
+            "thinkingConfig": {"thinkingLevel": "low"},
         },
     }
     started = time.perf_counter()

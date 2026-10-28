@@ -95,6 +95,11 @@ The underlying retrieval, grounded Q&A and evaluation APIs remain available thro
 ```powershell
 $env:GEMINI_API_KEY="your-key"
 $env:GEMINI_MODEL="gemini-3.5-flash-lite"
+$env:GEMINI_FIRST_TOKEN_TIMEOUT_SECONDS="12"
+$env:GEMINI_REQUEST_TIMEOUT_SECONDS="28"
+$env:GEMINI_GENERATION_BUDGET_SECONDS="40"
+$env:GEMINI_FALLBACK_FIRST_TOKEN_TIMEOUT_SECONDS="6"
+$env:GEMINI_FALLBACK_REQUEST_TIMEOUT_SECONDS="15"
 ```
 
 Run the complete enterprise application locally:

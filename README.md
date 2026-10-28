@@ -43,7 +43,7 @@ The corpus is **not hard-coded**. Users upload PDFs through the web UI or `POST 
 - Candidate expansion followed by intent-aware reranking.
 - Definition/method/purpose signals and table/numeric noise suppression.
 - Evidence/answerability gate with safe abstention.
-- Gemini streaming generation with strict evidence-only prompting and source IDs.
+- Gemini streaming generation with strict evidence-only prompting and source IDs. All evidence-supported questions use the language-model generation path; there is no local extractive-answer substitute.
 - Optional Ollama/OpenAI-compatible workflow remains available through the underlying application modules.
 - Grouped document/page citations and exact evidence inspection.
 

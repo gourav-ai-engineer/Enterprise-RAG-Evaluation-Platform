@@ -4,6 +4,10 @@ import gemini_main
 def test_simple_who_question_uses_local_evidence_and_citation() -> None:
     results = [
         {
+            "chunk_id": "chunk-profile-1",
+            "document_id": "doc-profile",
+            "chunk_id": "chunk-profile-2",
+            "document_id": "doc-profile",
             "filename": "profile.pdf",
             "page_start": 1,
             "page_end": 1,
@@ -22,6 +26,8 @@ def test_simple_who_question_uses_local_evidence_and_citation() -> None:
 def test_explanatory_question_uses_gemini_path() -> None:
     results = [
         {
+            "chunk_id": "chunk-rag-1",
+            "document_id": "doc-rag",
             "filename": "rag.pdf",
             "page_start": 1,
             "page_end": 1,
@@ -34,7 +40,7 @@ def test_explanatory_question_uses_gemini_path() -> None:
     ) is None
 
 
-def test_fast_answer_falls_back_if_sentence_cannot_be_cited() -> None:
+def test_fast_answer_declines_when_question_has_no_evidence() -> None:
     results = [
         {
             "filename": "profile.pdf",
@@ -43,9 +49,8 @@ def test_fast_answer_falls_back_if_sentence_cannot_be_cited() -> None:
             "text": "Gourav is an AI/ML engineer.",
         }
     ]
-    # The helper may only return sentences that can be traced back to retrieved text.
-    answer = gemini_main.fast_extractive_answer("Who is Gourav?", results)
-    assert answer == "Gourav is an AI/ML engineer. [Source 1]"
+    # A question unsupported by the evidence must remain on the model/abstention path.
+    assert gemini_main.fast_extractive_answer("Who is Maria?", results) is None
 
 
 def test_comparisons_are_not_answered_extractive() -> None:

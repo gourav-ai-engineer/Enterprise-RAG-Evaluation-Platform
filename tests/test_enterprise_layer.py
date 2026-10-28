@@ -22,9 +22,13 @@ def test_enterprise_root_exposes_telemetry_and_feedback_endpoint():
     with TestClient(app) as client:
         response = client.get("/")
         assert response.status_code == 200
-        assert "Enterprise telemetry" in response.text
-        # These server-side APIs are listed by the app's OpenAPI schema.
+        # Keep the main workbench focused; telemetry remains available via API only.
+        assert "Enterprise telemetry" not in response.text
+        assert 'id="enterpriseBar"' not in response.text
+        assert 'href="/docs"' not in response.text
+        # Backend telemetry and feedback APIs remain available.
         schema = client.get("/openapi.json").json()
+        assert "/api/enterprise/overview" in schema["paths"]
         assert "/api/traces" in schema["paths"]
         assert "/api/feedback" in schema["paths"]
 

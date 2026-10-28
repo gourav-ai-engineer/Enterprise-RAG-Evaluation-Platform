@@ -11,7 +11,7 @@ def test_gemini_overload_retries_then_falls_back(monkeypatch) -> None:
     async def fake_sleep(_seconds: float) -> None:
         return None
 
-    async def fake_generate(model: str, question: str, results: list[dict]):
+    async def fake_generate(model: str, question: str, results: list[dict], on_text=None):
         calls.append(model)
         if model == "gemini-3.8-flash":
             raise RuntimeError("Gemini HTTP 503: temporarily overloaded")
@@ -47,3 +47,29 @@ def test_non_transient_gemini_error_does_not_retry(monkeypatch) -> None:
         )
 
     assert calls == ["gemini-3.8-flash"]
+
+
+def test_streaming_callback_receives_partial_answer(monkeypatch) -> None:
+    chunks: list[str] = []
+
+    async def fake_generate(model: str, question: str, results: list[dict], on_text=None):
+        if on_text is not None:
+            await on_text("Gourav is ")
+            await on_text("an AI/ML engineer.")
+        return "Gourav is an AI/ML engineer.", 15.0, 40.0, 2
+
+    async def collect(piece: str) -> None:
+        chunks.append(piece)
+
+    monkeypatch.setattr(gemini_main, "gemini_stream_generate", fake_generate)
+    result = asyncio.run(
+        gemini_main.gemini_stream_generate_with_fallback(
+            "gemini-3.5-flash-lite",
+            "Who is Gourav?",
+            [{"text": "Gourav is an AI/ML engineer."}],
+            on_text=collect,
+        )
+    )
+
+    assert result[0] == "Gourav is an AI/ML engineer."
+    assert chunks == ["Gourav is ", "an AI/ML engineer."]

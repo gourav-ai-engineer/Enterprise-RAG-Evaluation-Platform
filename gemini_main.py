@@ -135,53 +135,6 @@ def compact_citations(results: list[dict]) -> list[dict]:
     ]
 
 
-FAST_FACTUAL_PATTERN = re.compile(
-    r"^(?:who\s+(?:is|was|are|were)|what\s+(?:is|are|was|were)|"
-    r"where\s+(?:is|are|was|were)|when\s+(?:is|are|was|were|did|does)|"
-    r"which\b|how many\b|how much\b|name\b|list\b)",
-    re.IGNORECASE,
-)
-FAST_COMPLEX_PATTERN = re.compile(
-    r"\b(?:why|explain|compare|comparison|difference|summari[sz]e|"
-    r"advantages|disadvantages|benefits|limitations|challenges|pros|cons|better|best|"
-    r"versus|vs|architecture|steps?|procedure|approach|method|overview|step by step|how does|how do)\b",
-    re.IGNORECASE,
-)
-
-
-def fast_extractive_answer(question: str, results: list[dict]) -> str | None:
-    """Answer simple factual lookups from retrieved sentences without a model call."""
-    if not FAST_FACTUAL_PATTERN.match(question.strip()):
-        return None
-    if FAST_COMPLEX_PATTERN.search(question) or len(core.content_tokens(question)) > 7:
-        return None
-
-    answer = core.extractive_answer(question, results)
-    if not answer or answer == core.ABSTAIN_MESSAGE or len(answer.split()) > 85:
-        return None
-
-    groups = evidence_groups(results)
-    source_id_by_filename = {group["filename"]: group["source_id"] for group in groups}
-    sentences = [
-        core.clean_text(item)
-        for item in re.split(r"(?<=[.!?])\s+", answer)
-        if item.strip()
-    ]
-    cited_sentences = []
-    for sentence in sentences:
-        source_id = None
-        for item in results:
-            if sentence.casefold() in core.clean_text(item["text"]).casefold():
-                source_id = source_id_by_filename.get(item["filename"])
-                if source_id is not None:
-                    break
-        # If the exact sentence cannot be traced to a retrieved passage, use Gemini instead.
-        if source_id is None:
-            return None
-        cited_sentences.append(f"{sentence} [Source {source_id}]")
-    return " ".join(cited_sentences) if cited_sentences else None
-
-
 def clean_answer(answer: str) -> str:
     """Normalize common LaTeX leakage from model output for the UI."""
     text = answer.strip()
@@ -378,61 +331,47 @@ async def ask_stream(body: StreamAskRequest):
                 mode = "abstain"
                 yield sse("stage", {"id": "generation", "label": "Grounding guard", "detail": "Evidence threshold not met · Gemini generation skipped", "done": True})
             else:
-                fast_answer = fast_extractive_answer(body.question, results)
-                if fast_answer:
-                    answer = fast_answer
-                    mode = "extractive_fast"
-                    model_used = None
-                    generation_ms = 0.0
-                    ttft_ms = 0.0
-                    yield sse("stage", {
+                yield sse("stage", {"id": "generation", "label": "Generating grounded answer", "detail": f"Gemini · {model} · streaming response", "active": True})
+                gen_started = time.perf_counter()
+                token_events: asyncio.Queue[str] = asyncio.Queue()
+
+                async def enqueue_text(piece: str) -> None:
+                    await token_events.put(sse("token", {"text": piece}))
+
+                async def reset_partial_answer(next_model: str) -> None:
+                    await token_events.put(sse("generation_reset", {"model": next_model}))
+                    await token_events.put(sse("stage", {
                         "id": "generation",
-                        "label": "Fast factual answer",
-                        "detail": "Answered directly from retrieved evidence · language model skipped",
-                        "done": True,
-                    })
-                else:
-                    yield sse("stage", {"id": "generation", "label": "Generating grounded answer", "detail": f"Gemini · {model} · streaming response", "active": True})
-                    gen_started = time.perf_counter()
-                    token_events: asyncio.Queue[str] = asyncio.Queue()
+                        "label": "Trying fallback model",
+                        "detail": f"Switching to {next_model}",
+                        "active": True,
+                    }))
 
-                    async def enqueue_text(piece: str) -> None:
-                        await token_events.put(sse("token", {"text": piece}))
-
-                    async def reset_partial_answer(next_model: str) -> None:
-                        await token_events.put(sse("generation_reset", {"model": next_model}))
-                        await token_events.put(sse("stage", {
-                            "id": "generation",
-                            "label": "Trying fallback model",
-                            "detail": f"Switching to {next_model}",
-                            "active": True,
-                        }))
-
-                    generation_task = asyncio.create_task(
-                        gemini_stream_generate_with_fallback(
-                            model,
-                            body.question,
-                            results,
-                            on_text=enqueue_text,
-                            on_reset=reset_partial_answer,
-                        )
+                generation_task = asyncio.create_task(
+                    gemini_stream_generate_with_fallback(
+                        model,
+                        body.question,
+                        results,
+                        on_text=enqueue_text,
+                        on_reset=reset_partial_answer,
                     )
-                    try:
-                        while not generation_task.done() or not token_events.empty():
-                            try:
-                                event = await asyncio.wait_for(token_events.get(), timeout=0.1)
-                                yield event
-                            except asyncio.TimeoutError:
-                                continue
-                        answer, ttft_ms, generation_ms, chunks, model_used = await generation_task
-                        mode = "gemini"
-                        fallback_note = f" · model {model_used}" if model_used != model else ""
-                        yield sse("stage", {"id": "generation", "label": "Answer ready", "detail": f"Completed{fallback_note} · first token {ttft_ms:.0f} ms · generation {generation_ms:.0f} ms · {chunks} chunks", "done": True})
-                    except Exception as exc:
-                        answer = f"Gemini generation failed: {str(exc)}"
-                        mode = "gemini_error"
-                        generation_ms = (time.perf_counter() - gen_started) * 1000
-                        yield sse("stage", {"id": "generation", "label": "Gemini generation failed", "detail": str(exc)[:300], "done": True, "error": True})
+                )
+                try:
+                    while not generation_task.done() or not token_events.empty():
+                        try:
+                            event = await asyncio.wait_for(token_events.get(), timeout=0.1)
+                            yield event
+                        except asyncio.TimeoutError:
+                            continue
+                    answer, ttft_ms, generation_ms, chunks, model_used = await generation_task
+                    mode = "gemini"
+                    fallback_note = f" · model {model_used}" if model_used != model else ""
+                    yield sse("stage", {"id": "generation", "label": "Answer ready", "detail": f"Completed{fallback_note} · first token {ttft_ms:.0f} ms · generation {generation_ms:.0f} ms · {chunks} chunks", "done": True})
+                except Exception as exc:
+                    answer = f"Gemini generation failed: {str(exc)}"
+                    mode = "gemini_error"
+                    generation_ms = (time.perf_counter() - gen_started) * 1000
+                    yield sse("stage", {"id": "generation", "label": "Gemini generation failed", "detail": str(exc)[:300], "done": True, "error": True})
             total_ms = (time.perf_counter() - total) * 1000
             payload = {
                 "question": body.question,
@@ -481,8 +420,8 @@ function showEvidence(i){const g=lastGroups[i];if(!g)return;$("evidenceTitle").t
 function closeEvidence(){$("evidenceModal").style.display='none'}
 function renderSources(groups){lastGroups=groups||[];$("sources").innerHTML=lastGroups.map((g,i)=>`<button class="source" onclick="showEvidence(${i})"><b>📄 Source ${g.source_id} · ${esc(g.filename)}</b><div class="pages">Pages ${esc(g.pages)} · ${g.chunks} chunk${g.chunks>1?'s':''}</div><div class="view">View exact evidence →</div></button>`).join('')}
 function setStage(e){const id=e.id;let el=document.querySelector(`[data-stage="${id}"]`);if(!el){el=document.createElement('div');el.className='stage';el.dataset.stage=id;$("stages").appendChild(el)}el.className='stage '+(e.done?'done':e.active?'active':'');el.innerHTML=`<div class="dot"></div><div><b>${esc(e.label)}</b><div class="muted">${esc(e.detail||'')}</div></div>`;$("loadTitle").textContent=e.label;$("loadDetail").textContent=e.detail||''}
-async function ask(){const question=$("q").value.trim();if(!question)return;const ids=[...selected];$("overlay").style.display='flex';$("stages").innerHTML='';$("answer").style.display='none';$("answer").textContent='';$("sources").innerHTML='';$("metrics").style.display='none';$("provider").textContent='Preparing answer…';const body={question,document_ids:ids,top_k:3,model:null};try{const res=await fetch('/api/ask/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!res.ok)throw new Error(await res.text());const reader=res.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {value,done}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const blocks=buf.split('\n\n');buf=blocks.pop()||'';for(const block of blocks){const lines=block.split('\n');const type=(lines.find(x=>x.startsWith('event:'))||'').slice(6).trim();const raw=(lines.find(x=>x.startsWith('data:'))||'').slice(5).trim();if(!raw)continue;const data=JSON.parse(raw);if(type==='stage'){setStage(data);if(data.id==='generation')$("provider").textContent=data.label+(data.detail?' · '+data.detail:'')}if(type==='token'){$("overlay").style.display='none';$("answer").style.display='block';$("answer").textContent+=data.text}if(type==='generation_reset'){$("answer").textContent='';$("answer").style.display='none';$("overlay").style.display='flex';$("provider").textContent='Trying '+(data.model||'alternate model')+'…'}if(type==='result'){renderResult(data);$("provider").textContent=data.mode==='gemini'?'Ready · '+(data.model||'Gemini'):(data.mode==='extractive_fast'?'Ready · instant evidence answer':(data.mode==='gemini_error'?'Generation unavailable':'Ready'))}if(type==='error')throw new Error(data.message)}}}catch(e){$("overlay").style.display='none';$("answer").style.display='block';$("answer").textContent='Request failed: '+e.message;$("provider").textContent='Request failed'}finally{$("overlay").style.display='none'}}
-function renderResult(d){$("answer").style.display='block';$("answer").textContent=d.answer;renderSources(d.evidence_groups||[]);const l=d.latency||{};$("metrics").style.display='grid';$("mR").textContent=(l.retrieval_ms??0).toFixed(0)+' ms';$("mK").textContent=(l.rerank_ms??0).toFixed(1)+' ms';const genLabel=$("metrics").querySelector('.metric:nth-child(3) span');if(d.mode==='extractive_fast'){genLabel.textContent='Answer path';$("mG").textContent='Local';$("mF").textContent='N/A'}else{genLabel.textContent='Generation';$("mG").textContent=(l.generation_ms??0).toFixed(0)+' ms';$("mF").textContent=(l.ttft_ms??0).toFixed(0)+' ms'}$("mT").textContent=(l.total_ms??0).toFixed(0)+' ms'}
+async function ask(){const question=$("q").value.trim();if(!question)return;const ids=[...selected];$("overlay").style.display='flex';$("stages").innerHTML='';$("answer").style.display='none';$("answer").textContent='';$("sources").innerHTML='';$("metrics").style.display='none';$("provider").textContent='Preparing answer…';const body={question,document_ids:ids,top_k:3,model:null};try{const res=await fetch('/api/ask/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!res.ok)throw new Error(await res.text());const reader=res.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {value,done}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const blocks=buf.split('\n\n');buf=blocks.pop()||'';for(const block of blocks){const lines=block.split('\n');const type=(lines.find(x=>x.startsWith('event:'))||'').slice(6).trim();const raw=(lines.find(x=>x.startsWith('data:'))||'').slice(5).trim();if(!raw)continue;const data=JSON.parse(raw);if(type==='stage'){setStage(data);if(data.id==='generation')$("provider").textContent=data.label+(data.detail?' · '+data.detail:'')}if(type==='token'){$("overlay").style.display='none';$("answer").style.display='block';$("answer").textContent+=data.text}if(type==='generation_reset'){$("answer").textContent='';$("answer").style.display='none';$("overlay").style.display='flex';$("provider").textContent='Trying '+(data.model||'alternate model')+'…'}if(type==='result'){renderResult(data);$("provider").textContent=data.mode==='gemini'?'Ready · '+(data.model||'Gemini'):(data.mode==='gemini_error'?'Generation unavailable':'Ready')}if(type==='error')throw new Error(data.message)}}}catch(e){$("overlay").style.display='none';$("answer").style.display='block';$("answer").textContent='Request failed: '+e.message;$("provider").textContent='Request failed'}finally{$("overlay").style.display='none'}}
+function renderResult(d){$("answer").style.display='block';$("answer").textContent=d.answer;renderSources(d.evidence_groups||[]);const l=d.latency||{};$("metrics").style.display='grid';$("mR").textContent=(l.retrieval_ms??0).toFixed(0)+' ms';$("mK").textContent=(l.rerank_ms??0).toFixed(1)+' ms';$("mG").textContent=(l.generation_ms??0).toFixed(0)+' ms';$("mF").textContent=(l.ttft_ms??0).toFixed(0)+' ms';$("mT").textContent=(l.total_ms??0).toFixed(0)+' ms'}
 function clearChat(){$("answer").style.display='none';$("sources").innerHTML='';$("metrics").style.display='none';lastGroups=[]}
 $("q").addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();ask()}});$("addPdfButton").addEventListener('click',()=>{$("file").click()});$("file").addEventListener('change',async e=>{const f=e.target.files[0];if(!f)return;const fd=new FormData();fd.append('file',f);$("provider").textContent='Indexing PDF…';try{const r=await fetch('/api/documents/upload',{method:'POST',body:fd});if(!r.ok)throw new Error(await r.text());await loadDocs();$("provider").textContent='PDF indexed · Gemini ready'}catch(err){alert('Upload failed: '+err.message)}e.target.value='' });loadDocs();runtime();
 </script></body></html>'''

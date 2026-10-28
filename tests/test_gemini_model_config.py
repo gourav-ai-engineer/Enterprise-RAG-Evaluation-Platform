@@ -39,3 +39,12 @@ def test_frontend_handles_partial_answer_events() -> None:
 
 def test_default_model_order_prefers_low_latency() -> None:
     assert gemini_main.GEMINI_MODELS[0] == "gemini-3.5-flash-lite"
+
+
+
+def test_answerable_questions_do_not_use_local_extractive_generation() -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "gemini_main.py").read_text(encoding="utf-8")
+    assert "def fast_extractive_answer" not in source
+    assert "extractive_fast" not in source
+    assert "gemini_stream_generate_with_fallback(" in source

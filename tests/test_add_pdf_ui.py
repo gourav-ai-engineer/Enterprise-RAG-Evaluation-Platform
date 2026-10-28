@@ -7,4 +7,4 @@ def test_add_pdf_button_has_a_valid_click_listener() -> None:
 
     assert '<button id="addPdfButton" class="primary" type="button">+ Add PDF</button>' in source
     assert '$("addPdfButton").addEventListener(\'click\',()=>{$("file").click()})' in source
-    assert r"document.getElementById(\\'file\\').click()" not in source
+    assert r"document.getElementById(\'file\').click()" not in source

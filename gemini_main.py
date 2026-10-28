@@ -143,7 +143,8 @@ FAST_FACTUAL_PATTERN = re.compile(
 )
 FAST_COMPLEX_PATTERN = re.compile(
     r"\b(?:why|explain|compare|comparison|difference|summari[sz]e|"
-    r"advantages|disadvantages|pros|cons|architecture|step by step|how does|how do)\b",
+    r"advantages|disadvantages|benefits|limitations|challenges|pros|cons|better|best|"
+    r"versus|vs|architecture|steps?|procedure|approach|method|overview|step by step|how does|how do)\b",
     re.IGNORECASE,
 )
 

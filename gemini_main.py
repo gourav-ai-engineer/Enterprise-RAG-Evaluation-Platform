@@ -6,7 +6,7 @@ import os
 import re
 import time
 from collections import defaultdict
-from typing import AsyncIterator
+from typing import AsyncIterator, Awaitable, Callable
 
 import httpx
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -21,17 +21,19 @@ app.routes[:] = [
     if getattr(route, "path", None) not in {"/", "/api/runtime", "/api/ask/stream"}
 ]
 
+# Prefer the low-latency model for short, evidence-grounded document questions.
+# Fallback order favours response speed first, then higher-capability models.
 GEMINI_MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3.8-flash",
 ]
 
 
 def resolve_gemini_model(configured: str | None = None) -> str:
     """Use a supported Gemini model, falling back from stale environment settings."""
     requested = configured if configured is not None else os.getenv("GEMINI_MODEL")
-    return requested if requested in GEMINI_MODELS else "gemini-3.8-flash"
+    return requested if requested in GEMINI_MODELS else "gemini-3.5-flash-lite"
 
 
 DEFAULT_GEMINI_MODEL = resolve_gemini_model()
@@ -160,7 +162,12 @@ def clean_answer(answer: str) -> str:
     return text.strip()
 
 
-async def gemini_stream_generate(model: str, question: str, results: list[dict]) -> tuple[str, float, float, int]:
+async def gemini_stream_generate(
+    model: str,
+    question: str,
+    results: list[dict],
+    on_text: Callable[[str], Awaitable[None]] | None = None,
+) -> tuple[str, float, float, int]:
     key = gemini_key()
     if not key:
         raise RuntimeError("GEMINI_API_KEY is not set")
@@ -170,8 +177,12 @@ async def gemini_stream_generate(model: str, question: str, results: list[dict])
         "contents": [{"role": "user", "parts": [{"text": user}]}],
         "generationConfig": {
             "maxOutputTokens": 256,
-            "temperature": 0.0,
-            "thinkingConfig": {"thinkingLevel": "low"},
+            # Simple factual RAG questions do not need deep reasoning.
+            "thinkingConfig": {
+                "thinkingLevel": "minimal" if model in {
+                    "gemini-3.5-flash-lite", "gemini-3.6-flash"
+                } else "low"
+            },
         },
     }
     started = time.perf_counter()
@@ -179,7 +190,7 @@ async def gemini_stream_generate(model: str, question: str, results: list[dict])
     chunks = 0
     pieces: list[str] = []
     finish_reason = None
-    timeout = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+    timeout = httpx.Timeout(connect=8.0, read=35.0, write=8.0, pool=8.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream(
             "POST", gemini_url(model),
@@ -210,6 +221,8 @@ async def gemini_stream_generate(model: str, question: str, results: list[dict])
                         ttft_ms = (time.perf_counter() - started) * 1000
                     pieces.append(text)
                     chunks += 1
+                    if on_text is not None:
+                        await on_text(text)
     generation_ms = (time.perf_counter() - started) * 1000
     answer = clean_answer("".join(pieces))
     if not answer:
@@ -220,19 +233,38 @@ async def gemini_stream_generate(model: str, question: str, results: list[dict])
 
 
 async def gemini_stream_generate_with_fallback(
-    model: str, question: str, results: list[dict]
+    model: str,
+    question: str,
+    results: list[dict],
+    on_text: Callable[[str], Awaitable[None]] | None = None,
+    on_reset: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[str, float, float, int, str]:
-    """Retry transient Gemini errors, then try the other supported Flash models."""
+    """Stream partial answer text, retry briefly, and cap total generation time."""
     requested = resolve_gemini_model(model)
     models = [requested] + [item for item in GEMINI_MODELS if item != requested]
     failures: list[str] = []
+    budget_seconds = max(10.0, float(os.getenv("GEMINI_GENERATION_BUDGET_SECONDS", "60")))
+    request_timeout = max(5.0, float(os.getenv("GEMINI_REQUEST_TIMEOUT_SECONDS", "35")))
+    deadline = time.monotonic() + budget_seconds
 
-    for candidate_model in models:
-        for attempt in range(2):
+    for model_index, candidate_model in enumerate(models):
+        # Retry the initially selected model once; try each fallback only once.
+        attempts = 2 if model_index == 0 else 1
+        for attempt in range(attempts):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if (model_index > 0 or attempt > 0) and on_reset is not None:
+                await on_reset(candidate_model)
+
             try:
-                answer, ttft_ms, generation_ms, chunks = await gemini_stream_generate(
-                    candidate_model, question, results
+                result = await asyncio.wait_for(
+                    gemini_stream_generate(
+                        candidate_model, question, results, on_text=on_text
+                    ),
+                    timeout=min(remaining, request_timeout),
                 )
+                answer, ttft_ms, generation_ms, chunks = result
                 return answer, ttft_ms, generation_ms, chunks, candidate_model
             except Exception as exc:
                 message = str(exc)
@@ -240,23 +272,25 @@ async def gemini_stream_generate_with_fallback(
                 status = int(match.group(1)) if match else None
                 transient = (
                     status in {408, 429, 500, 502, 503, 504}
-                    or isinstance(exc, (httpx.TimeoutException, httpx.NetworkError))
+                    or isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, asyncio.TimeoutError))
                 )
-                # 404 can indicate a model that is unavailable to this API project.
+                # Retry only transient issues or unavailable models. Do not loop on auth/config errors.
                 if not transient and status != 404:
                     raise
 
-                failures.append(f"{candidate_model}: {message[:220]}")
-                if transient and attempt == 0:
-                    # Google's guidance recommends exponential backoff for transient 5xx/429 errors.
-                    await asyncio.sleep(1.0)
+                failures.append(f"{candidate_model}: {message[:180] or type(exc).__name__}")
+                if transient and model_index == 0 and attempt == 0:
+                    await asyncio.sleep(0.5)
                     continue
                 break
 
+        if time.monotonic() >= deadline:
+            break
+
     detail = " | ".join(failures[-3:])
     raise RuntimeError(
-        "All configured Gemini Flash models failed after retry/fallback. "
-        "The Gemini service may be overloaded; try again shortly. "
+        f"Gemini could not complete the answer within {budget_seconds:.0f} seconds. "
+        "The service may be overloaded; please retry shortly. "
         + detail
     )
 
@@ -299,13 +333,40 @@ async def ask_stream(body: StreamAskRequest):
             else:
                 yield sse("stage", {"id": "generation", "label": "Generating grounded answer", "detail": f"Gemini · {model} · streaming response", "active": True})
                 gen_started = time.perf_counter()
-                try:
-                    answer, ttft_ms, generation_ms, chunks, model_used = await gemini_stream_generate_with_fallback(
-                        model, body.question, results
+                token_events: asyncio.Queue[str] = asyncio.Queue()
+
+                async def enqueue_text(piece: str) -> None:
+                    await token_events.put(sse("token", {"text": piece}))
+
+                async def reset_partial_answer(next_model: str) -> None:
+                    await token_events.put(sse("generation_reset", {"model": next_model}))
+                    await token_events.put(sse("stage", {
+                        "id": "generation",
+                        "label": "Trying fallback model",
+                        "detail": f"Switching to {next_model}",
+                        "active": True,
+                    }))
+
+                generation_task = asyncio.create_task(
+                    gemini_stream_generate_with_fallback(
+                        model,
+                        body.question,
+                        results,
+                        on_text=enqueue_text,
+                        on_reset=reset_partial_answer,
                     )
+                )
+                try:
+                    while not generation_task.done() or not token_events.empty():
+                        try:
+                            event = await asyncio.wait_for(token_events.get(), timeout=0.1)
+                            yield event
+                        except asyncio.TimeoutError:
+                            continue
+                    answer, ttft_ms, generation_ms, chunks, model_used = await generation_task
                     mode = "gemini"
-                    fallback_note = f" · fallback model {model_used}" if model_used != model else ""
-                    yield sse("stage", {"id": "generation", "label": "Generating grounded answer", "detail": f"Completed{fallback_note} · TTFT {ttft_ms:.0f} ms · {generation_ms:.0f} ms total · {chunks} chunks", "done": True})
+                    fallback_note = f" · model {model_used}" if model_used != model else ""
+                    yield sse("stage", {"id": "generation", "label": "Answer ready", "detail": f"Completed{fallback_note} · first token {ttft_ms:.0f} ms · generation {generation_ms:.0f} ms · {chunks} chunks", "done": True})
                 except Exception as exc:
                     answer = f"Gemini generation failed: {str(exc)}"
                     mode = "gemini_error"
@@ -359,7 +420,7 @@ function showEvidence(i){const g=lastGroups[i];if(!g)return;$("evidenceTitle").t
 function closeEvidence(){$("evidenceModal").style.display='none'}
 function renderSources(groups){lastGroups=groups||[];$("sources").innerHTML=lastGroups.map((g,i)=>`<button class="source" onclick="showEvidence(${i})"><b>📄 Source ${g.source_id} · ${esc(g.filename)}</b><div class="pages">Pages ${esc(g.pages)} · ${g.chunks} chunk${g.chunks>1?'s':''}</div><div class="view">View exact evidence →</div></button>`).join('')}
 function setStage(e){const id=e.id;let el=document.querySelector(`[data-stage="${id}"]`);if(!el){el=document.createElement('div');el.className='stage';el.dataset.stage=id;$("stages").appendChild(el)}el.className='stage '+(e.done?'done':e.active?'active':'');el.innerHTML=`<div class="dot"></div><div><b>${esc(e.label)}</b><div class="muted">${esc(e.detail||'')}</div></div>`;$("loadTitle").textContent=e.label;$("loadDetail").textContent=e.detail||''}
-async function ask(){const question=$("q").value.trim();if(!question)return;const ids=[...selected];$("overlay").style.display='flex';$("stages").innerHTML='';$("answer").style.display='none';$("sources").innerHTML='';$("metrics").style.display='none';const body={question,document_ids:ids,top_k:3,model:null};try{const res=await fetch('/api/ask/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!res.ok)throw new Error(await res.text());const reader=res.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {value,done}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const blocks=buf.split('\n\n');buf=blocks.pop()||'';for(const block of blocks){const lines=block.split('\n');const type=(lines.find(x=>x.startsWith('event:'))||'').slice(6).trim();const raw=(lines.find(x=>x.startsWith('data:'))||'').slice(5).trim();if(!raw)continue;const data=JSON.parse(raw);if(type==='stage')setStage(data);if(type==='result')renderResult(data);if(type==='error')throw new Error(data.message)}}}catch(e){$("answer").style.display='block';$("answer").textContent='Request failed: '+e.message}finally{$("overlay").style.display='none'}}
+async function ask(){const question=$("q").value.trim();if(!question)return;const ids=[...selected];$("overlay").style.display='flex';$("stages").innerHTML='';$("answer").style.display='none';$("answer").textContent='';$("sources").innerHTML='';$("metrics").style.display='none';$("provider").textContent='Preparing answer…';const body={question,document_ids:ids,top_k:3,model:null};try{const res=await fetch('/api/ask/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!res.ok)throw new Error(await res.text());const reader=res.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {value,done}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const blocks=buf.split('\n\n');buf=blocks.pop()||'';for(const block of blocks){const lines=block.split('\n');const type=(lines.find(x=>x.startsWith('event:'))||'').slice(6).trim();const raw=(lines.find(x=>x.startsWith('data:'))||'').slice(5).trim();if(!raw)continue;const data=JSON.parse(raw);if(type==='stage'){setStage(data);if(data.id==='generation')$("provider").textContent=data.label+(data.detail?' · '+data.detail:'')}if(type==='token'){$("overlay").style.display='none';$("answer").style.display='block';$("answer").textContent+=data.text}if(type==='generation_reset'){$("answer").textContent='';$("answer").style.display='none';$("overlay").style.display='flex';$("provider").textContent='Trying '+(data.model||'alternate model')+'…'}if(type==='result'){renderResult(data);$("provider").textContent=data.mode==='gemini'?'Ready · '+(data.model||'Gemini'):(data.mode==='gemini_error'?'Generation unavailable':'Ready')}if(type==='error')throw new Error(data.message)}}}catch(e){$("overlay").style.display='none';$("answer").style.display='block';$("answer").textContent='Request failed: '+e.message;$("provider").textContent='Request failed'}finally{$("overlay").style.display='none'}}
 function renderResult(d){$("answer").style.display='block';$("answer").textContent=d.answer;renderSources(d.evidence_groups||[]);const l=d.latency||{};$("metrics").style.display='grid';$("mR").textContent=(l.retrieval_ms??0).toFixed(0)+' ms';$("mK").textContent=(l.rerank_ms??0).toFixed(1)+' ms';$("mG").textContent=(l.generation_ms??0).toFixed(0)+' ms';$("mT").textContent=(l.total_ms??0).toFixed(0)+' ms'}
 function clearChat(){$("answer").style.display='none';$("sources").innerHTML='';$("metrics").style.display='none';lastGroups=[]}
 $("q").addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();ask()}});$("addPdfButton").addEventListener('click',()=>{$("file").click()});$("file").addEventListener('change',async e=>{const f=e.target.files[0];if(!f)return;const fd=new FormData();fd.append('file',f);$("provider").textContent='Indexing PDF…';try{const r=await fetch('/api/documents/upload',{method:'POST',body:fd});if(!r.ok)throw new Error(await r.text());await loadDocs();$("provider").textContent='PDF indexed · Gemini ready'}catch(err){alert('Upload failed: '+err.message)}e.target.value='' });loadDocs();runtime();

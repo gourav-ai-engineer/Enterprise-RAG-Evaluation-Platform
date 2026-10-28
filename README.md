@@ -94,7 +94,7 @@ The underlying retrieval, grounded Q&A and evaluation APIs remain available thro
 
 ```powershell
 $env:GEMINI_API_KEY="your-key"
-$env:GEMINI_MODEL="gemini-3.8-flash"
+$env:GEMINI_MODEL="gemini-3.5-flash-lite"
 ```
 
 Run the complete enterprise application locally:

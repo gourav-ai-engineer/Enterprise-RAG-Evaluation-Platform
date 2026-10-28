@@ -24,7 +24,7 @@ def test_generation_uses_supported_thinking_level() -> None:
         source = (root / name).read_text(encoding="utf-8")
         if name == "gemini_main.py":
             assert '"thinkingLevel": "minimal" if model in {' in source
-            assert '"thinkingLevel": "low"' in source
+            assert 'else "low"' in source
         else:
             assert '"thinkingLevel": "low"' in source
 

@@ -176,7 +176,7 @@ async def gemini_stream_generate(
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": [{"role": "user", "parts": [{"text": user}]}],
         "generationConfig": {
-            "maxOutputTokens": 256,
+            "maxOutputTokens": 160,
             # Simple factual RAG questions do not need deep reasoning.
             "thinkingConfig": {
                 "thinkingLevel": "minimal" if model in {
@@ -243,6 +243,8 @@ async def gemini_stream_generate_with_fallback(
     requested = resolve_gemini_model(model)
     models = [requested] + [item for item in GEMINI_MODELS if item != requested]
     failures: list[str] = []
+    generation_started = time.perf_counter()
+    first_token_ms: float | None = None
 
     budget_seconds = max(8.0, float(os.getenv("GEMINI_GENERATION_BUDGET_SECONDS", "35")))
     request_timeout = max(1.0, float(os.getenv("GEMINI_REQUEST_TIMEOUT_SECONDS", "14")))
@@ -262,6 +264,9 @@ async def gemini_stream_generate_with_fallback(
             first_text = asyncio.Event()
 
             async def relay_text(piece: str) -> None:
+                nonlocal first_token_ms
+                if first_token_ms is None:
+                    first_token_ms = (time.perf_counter() - generation_started) * 1000
                 first_text.set()
                 if on_text is not None:
                     await on_text(piece)
@@ -281,8 +286,9 @@ async def gemini_stream_generate_with_fallback(
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if generation_task in done:
-                    answer, ttft_ms, generation_ms, chunks = await generation_task
-                    return answer, ttft_ms, generation_ms, chunks, candidate_model
+                    answer, _, _, chunks = await generation_task
+                    elapsed_ms = (time.perf_counter() - generation_started) * 1000
+                    return answer, first_token_ms or elapsed_ms, elapsed_ms, chunks, candidate_model
 
                 if first_token_waiter not in done:
                     generation_task.cancel()
@@ -295,10 +301,11 @@ async def gemini_stream_generate_with_fallback(
                 remaining_attempt = attempt_deadline - time.monotonic()
                 if remaining_attempt <= 0:
                     raise asyncio.TimeoutError(f"{candidate_model} request timed out")
-                answer, ttft_ms, generation_ms, chunks = await asyncio.wait_for(
+                answer, _, _, chunks = await asyncio.wait_for(
                     generation_task, timeout=remaining_attempt
                 )
-                return answer, ttft_ms, generation_ms, chunks, candidate_model
+                elapsed_ms = (time.perf_counter() - generation_started) * 1000
+                return answer, first_token_ms or elapsed_ms, elapsed_ms, chunks, candidate_model
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -331,10 +338,11 @@ async def gemini_stream_generate_with_fallback(
             break
 
     detail = " | ".join(failures[-3:])
+    elapsed = time.perf_counter() - generation_started
     raise RuntimeError(
-        f"Gemini could not complete the answer within {budget_seconds:.0f} seconds. "
-        "Each model is given a short first-token window; the service may be overloaded. "
-        "Please retry shortly. " + detail
+        f"Gemini could not complete the answer within {budget_seconds:.0f} seconds "
+        f"(elapsed {elapsed:.1f}s). Each model gets a {first_token_timeout:.0f}s first-token window. "
+        "The service may be overloaded; please retry shortly. " + detail
     )
 
 

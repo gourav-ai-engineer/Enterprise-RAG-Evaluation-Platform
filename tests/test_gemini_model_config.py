@@ -27,3 +27,15 @@ def test_generation_uses_supported_thinking_level() -> None:
             assert '"thinkingLevel": "low"' in source
         else:
             assert '"thinkingLevel": "low"' in source
+
+
+def test_frontend_handles_partial_answer_events() -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "gemini_main.py").read_text(encoding="utf-8")
+    assert 'sse("token", {"text": piece})' in source
+    assert "if(type==='token')" in source
+    assert "generation_reset" in source
+
+
+def test_default_model_order_prefers_low_latency() -> None:
+    assert gemini_main.GEMINI_MODELS[0] == "gemini-3.5-flash-lite"

@@ -523,23 +523,102 @@ button,input,textarea{font:inherit}button{color:inherit}button:focus-visible,inp
 <script>
 const $=id=>document.getElementById(id);let docs=[],selected=new Set(JSON.parse(localStorage.getItem('rag_scope')||'[]')),lastGroups=[],isAsking=false,toastTimer=null;
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-async function loadDocs(){const r=await fetch('/api/documents');const d=await r.json();docs=d.documents||[];if(!selected.size)docs.forEach(x=>selected.add(x.id));renderDocs();updateScope()}
+function showToast(message,kind='info'){const el=$("toast");if(!el)return;el.textContent=message;el.dataset.kind=kind;el.classList.add('visible');if(toastTimer)clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove('visible'),3600)}
+async function loadDocs(){try{const r=await fetch('/api/documents');if(!r.ok)throw new Error('Document request failed');const d=await r.json();docs=d.documents||[];const valid=new Set(docs.map(x=>x.id));selected=new Set([...selected].filter(id=>valid.has(id));if(!selected.size&&docs.length)docs.forEach(x=>selected.add(x.id));localStorage.setItem('rag_scope',JSON.stringify([...selected]));renderDocs();updateScope();updateEmptyState()}catch(e){showToast('Could not load the document list. Check that the API is running.','error')}}
+function updateEmptyState(){const hasDocs=docs.length>0;$("emptyKicker").textContent=hasDocs?'READY TO ASK':'GET STARTED';$("emptyTitle").textContent=hasDocs?'Your documents are ready':'Start with a PDF';$("emptyDescription").textContent=hasDocs?'Ask a specific question, then inspect the source passages to verify the answer.':'Upload a PDF to index its contents, then ask a question about what it says.';$("promptExamples").style.display=hasDocs?'flex':'none'}
+function setPrompt(text){$("q").value=text;$("q").focus();$("q").dispatchEvent(new Event('input'))}
 async function runtime(){try{const r=await fetch('/api/runtime');const d=await r.json();$("provider").textContent=`Gemini · ${d.default_model} · streaming`}catch{$("provider").textContent='Gemini · unavailable'}}
 function renderDocs(){const box=$("docs");box.innerHTML=docs.length?docs.map(d=>`<label class="docrow"><input type="checkbox" data-id="${esc(d.id)}" ${selected.has(d.id)?'checked':''} onchange="syncCount()"><div class="info"><b>${esc(d.filename)}</b><div class="muted">${d.pages} pages · ${d.chunks} chunks</div></div></label>`).join(''):`<div style="padding:25px" class="muted">No PDFs indexed yet. Add a PDF to begin.</div>`;syncCount()}
 function syncCount(){const checked=[...document.querySelectorAll('#docs input:checked')];$("selCount").textContent=checked.length?`${checked.length} document${checked.length>1?'s':''} selected`:'No documents selected'}
 function selectAll(){document.querySelectorAll('#docs input').forEach(x=>x.checked=true);syncCount()}
 function clearSelect(){document.querySelectorAll('#docs input').forEach(x=>x.checked=false);syncCount()}
 function applyScope(){selected=new Set([...document.querySelectorAll('#docs input:checked')].map(x=>x.dataset.id));localStorage.setItem('rag_scope',JSON.stringify([...selected]));updateScope();closeScope()}
-function updateScope(){const n=selected.size;const all=docs.length&&n===docs.length;$("scopeBtn").textContent=all?'All documents':`${n} selected`;$("scopeText").textContent=all?'Using all documents':`Using ${n} selected document${n===1?'':'s'}`}
+function updateScope(){const n=selected.size;const all=!n||n===docs.length;$("scopeBtn").textContent=all?'All documents':`${n} selected`;$("scopeText").textContent=!docs.length?'No documents indexed':all?'Searching all indexed documents':`Searching ${n} selected document${n===1?'':'s'}`}
 function openScope(){renderDocs();$("modal").style.display='flex'}function closeScope(){$("modal").style.display='none'}
 function showEvidence(i){const g=lastGroups[i];if(!g)return;$("evidenceTitle").textContent=`Source ${g.source_id} · ${g.filename}`;$("evidencePages").textContent=`Pages ${g.pages} · ${g.chunks} retrieved chunk${g.chunks>1?'s':''}`;$("evidenceBody").innerHTML=g.evidence.map((e,j)=>`<div class="evidence"><div class="evidencehead"><b>Evidence passage ${j+1}</b><span class="muted">Pages ${esc(e.pages)}</span></div><pre>${esc(e.text)}</pre></div>`).join('');$("evidenceModal").style.display='flex'}
 function closeEvidence(){$("evidenceModal").style.display='none'}
 function renderSources(groups){lastGroups=groups||[];$("sources").innerHTML=lastGroups.map((g,i)=>`<button class="source" onclick="showEvidence(${i})"><b>📄 Source ${g.source_id} · ${esc(g.filename)}</b><div class="pages">Pages ${esc(g.pages)} · ${g.chunks} chunk${g.chunks>1?'s':''}</div><div class="view">View exact evidence →</div></button>`).join('')}
-function setStage(e){const id=e.id;let el=document.querySelector(`[data-stage="${id}"]`);if(!el){el=document.createElement('div');el.className='stage';el.dataset.stage=id;$("stages").appendChild(el)}el.className='stage '+(e.done?'done':e.active?'active':'');el.innerHTML=`<div class="dot"></div><div><b>${esc(e.label)}</b><div class="muted">${esc(e.detail||'')}</div></div>`;$("loadTitle").textContent=e.label;$("loadDetail").textContent=e.detail||''}
-async function ask(){const question=$("q").value.trim();if(!question)return;const ids=[...selected];$("overlay").style.display='flex';$("stages").innerHTML='';$("answer").style.display='none';$("answer").textContent='';$("sources").innerHTML='';$("metrics").style.display='none';$("provider").textContent='Preparing answer…';const body={question,document_ids:ids,top_k:3,model:null};try{const res=await fetch('/api/ask/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!res.ok)throw new Error(await res.text());const reader=res.body.getReader(),dec=new TextDecoder();let buf='';while(true){const {value,done}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const blocks=buf.split('\n\n');buf=blocks.pop()||'';for(const block of blocks){const lines=block.split('\n');const type=(lines.find(x=>x.startsWith('event:'))||'').slice(6).trim();const raw=(lines.find(x=>x.startsWith('data:'))||'').slice(5).trim();if(!raw)continue;const data=JSON.parse(raw);if(type==='stage'){setStage(data);if(data.id==='generation')$("provider").textContent=data.label+(data.detail?' · '+data.detail:'')}if(type==='token'){$("overlay").style.display='none';$("answer").style.display='block';$("answer").textContent+=data.text}if(type==='generation_reset'){$("answer").textContent='';$("answer").style.display='none';$("overlay").style.display='flex';$("provider").textContent='Trying '+(data.model||'alternate model')+'…'}if(type==='result'){renderResult(data);$("provider").textContent=data.mode==='gemini'?'Ready · '+(data.model||'Gemini'):(data.mode==='gemini_error'?'Generation unavailable':'Ready')}if(type==='error')throw new Error(data.message)}}}catch(e){$("overlay").style.display='none';$("answer").style.display='block';$("answer").textContent='Request failed: '+e.message;$("provider").textContent='Request failed'}finally{$("overlay").style.display='none'}}
-function renderResult(d){$("answer").style.display='block';$("answer").textContent=d.answer;renderSources(d.evidence_groups||[]);const l=d.latency||{};$("metrics").style.display='grid';$("mR").textContent=(l.retrieval_ms??0).toFixed(0)+' ms';$("mK").textContent=(l.rerank_ms??0).toFixed(1)+' ms';$("mG").textContent=(l.generation_ms??0).toFixed(0)+' ms';$("mF").textContent=(l.ttft_ms??0).toFixed(0)+' ms';$("mT").textContent=(l.total_ms??0).toFixed(0)+' ms'}
-function clearChat(){$("answer").style.display='none';$("sources").innerHTML='';$("metrics").style.display='none';lastGroups=[]}
-$("q").addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();ask()}});$("addPdfButton").addEventListener('click',()=>{$("file").click()});$("file").addEventListener('change',async e=>{const f=e.target.files[0];if(!f)return;const fd=new FormData();fd.append('file',f);$("provider").textContent='Indexing PDF…';try{const r=await fetch('/api/documents/upload',{method:'POST',body:fd});if(!r.ok)throw new Error(await r.text());await loadDocs();$("provider").textContent='PDF indexed · Gemini ready'}catch(err){alert('Upload failed: '+err.message)}e.target.value='' });loadDocs();runtime();
+function setStage(e){const id=e.id;let el=document.querySelector(`[data-stage="${id}"]`);if(!el){el=document.createElement('div');el.className='stage';el.dataset.stage=id;$("stages").appendChild(el)}el.className='stage '+(e.done?'done':e.active?'active':'');el.innerHTML=`<div class="dot"></div><div><b>${esc(e.label)}</b><div class="muted">${esc(e.detail||'')}</div></div>`;$("loadTitle").textContent=e.label;$("loadDetail").textContent=e.detail||'';$("progressStatus").style.display='flex';$("progressText").textContent=e.label+(e.detail?' · '+e.detail:'')}
+async function ask(){
+ const question=$("q").value.trim();
+ if(!question||isAsking)return;
+ if(!docs.length){showToast('Add a PDF before asking a question.','error');return}
+ isAsking=true;
+ const send=$("sendBtn");send.disabled=true;
+ const ids=[...selected];
+ $("overlay").style.display='flex';$("overlay").setAttribute('aria-busy','true');
+ $("stages").innerHTML='';$("emptyState").style.display='none';
+ $("answer").style.display='none';$("answer").textContent='';
+ $("sources").innerHTML='';$("metrics").style.display='none';
+ $("progressStatus").style.display='flex';$("progressText").textContent='Searching your documents…';
+ $("provider").textContent='Preparing answer…';
+ const body={question,document_ids:ids,top_k:3,model:null};
+ try{
+  const res=await fetch('/api/ask/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(!res.ok)throw new Error(await res.text());
+  const reader=res.body.getReader(),dec=new TextDecoder();let buf='';
+  while(true){
+   const {value,done}=await reader.read();if(done)break;
+   buf+=dec.decode(value,{stream:true});const blocks=buf.split('\n\n');buf=blocks.pop()||'';
+   for(const block of blocks){
+    const lines=block.split('\n');const type=(lines.find(x=>x.startsWith('event:'))||'').slice(6).trim();
+    const raw=(lines.find(x=>x.startsWith('data:'))||'').slice(5).trim();if(!raw)continue;
+    const data=JSON.parse(raw);
+    if(type==='stage'){
+     setStage(data);
+     if(data.id==='generation')$("provider").textContent=data.label+(data.detail?' · '+data.detail:'');
+    }
+    if(type==='token'){
+     $("overlay").style.display='none';$("answer").style.display='block';$("answer").textContent+=data.text;
+     $("progressText").textContent='Receiving answer from Gemini…';
+    }
+    if(type==='generation_reset'){
+     $("answer").textContent='';$("answer").style.display='none';$("overlay").style.display='flex';
+     $("provider").textContent='Trying '+(data.model||'alternate model')+'…';
+     $("progressText").textContent='Switching to '+(data.model||'another model')+'…';
+    }
+    if(type==='result'){
+     renderResult(data);
+     const failed=data.mode==='gemini_error';
+     $("provider").textContent=failed?'Generation unavailable':'Ready · '+(data.model||'Gemini');
+     $("progressText").textContent=failed?'Generation failed · review the message above':'Answer ready · sources below';
+     if(failed)showToast('Gemini could not complete the answer. Check the model/service error above.','error');
+    }
+    if(type==='error')throw new Error(data.message);
+   }
+  }
+ }catch(e){
+  $("overlay").style.display='none';$("answer").style.display='block';
+  $("answer").textContent='Request failed: '+e.message;$("provider").textContent='Request failed';
+  $("progressStatus").style.display='flex';$("progressText").textContent='Request failed';
+  showToast('The request failed. See the answer area for details.','error');
+ }finally{
+  $("overlay").style.display='none';$("overlay").setAttribute('aria-busy','false');
+  send.disabled=false;isAsking=false;
+ }
+}
+function renderResult(d){$("emptyState").style.display='none';$("answer").style.display='block';$("answer").textContent=d.answer;renderSources(d.evidence_groups||[]);const l=d.latency||{};$("metrics").style.display='grid';$("mR").textContent=(l.retrieval_ms??0).toFixed(0)+' ms';$("mK").textContent=(l.rerank_ms??0).toFixed(1)+' ms';$("mG").textContent=(l.generation_ms??0).toFixed(0)+' ms';$("mF").textContent=(l.ttft_ms??0).toFixed(0)+' ms';$("mT").textContent=(l.total_ms??0).toFixed(0)+' ms';$("progressStatus").style.display='flex'}
+function clearChat(){$("answer").style.display='none';$("answer").textContent='';$("sources").innerHTML='';$("metrics").style.display='none';$("progressStatus").style.display='none';$("stages").innerHTML='';$("emptyState").style.display='flex';lastGroups=[];updateEmptyState()}
+$("q").addEventListener('input',()=>{const el=$("q");el.style.height='auto';el.style.height=Math.min(el.scrollHeight,180)+'px'});
+$("q").addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();ask()}});
+$("addPdfButton").addEventListener('click',()=> $("file").click());
+$("file").addEventListener('change',async e=>{
+ const f=e.target.files[0];if(!f)return;
+ const button=$("addPdfButton"),previous=button.innerHTML,fd=new FormData();fd.append('file',f);
+ button.disabled=true;button.innerHTML='<span class="button-icon">…</span><span>Adding PDF</span>';
+ $("provider").textContent='Uploading and indexing PDF…';
+ try{
+  const r=await fetch('/api/documents/upload',{method:'POST',body:fd});
+  if(!r.ok)throw new Error(await r.text());
+  await loadDocs();showToast('Indexed '+f.name+' successfully.','success');
+  $("provider").textContent='PDF indexed · Gemini ready';
+ }catch(err){
+  showToast('Upload failed: '+err.message,'error');$("provider").textContent='Upload failed';
+ }finally{
+  button.disabled=false;button.innerHTML=previous;e.target.value='';
+ }
+});
+loadDocs();runtime();
 </script></body></html>'''
 
 

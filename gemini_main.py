@@ -239,21 +239,29 @@ async def gemini_stream_generate_with_fallback(
     on_text: Callable[[str], Awaitable[None]] | None = None,
     on_reset: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[str, float, float, int, str]:
-    """Bound generation latency and fail over when a model is slow to start."""
+    """Allow normal model startup time, then fail over with a bounded total budget."""
     requested = resolve_gemini_model(model)
     models = [requested] + [item for item in GEMINI_MODELS if item != requested]
     failures: list[str] = []
     generation_started = time.perf_counter()
     first_token_ms: float | None = None
 
-    budget_seconds = max(8.0, float(os.getenv("GEMINI_GENERATION_BUDGET_SECONDS", "25")))
-    request_timeout = max(1.0, float(os.getenv("GEMINI_REQUEST_TIMEOUT_SECONDS", "10")))
-    first_token_timeout = max(0.5, float(os.getenv("GEMINI_FIRST_TOKEN_TIMEOUT_SECONDS", "4")))
+    budget_seconds = max(15.0, float(os.getenv("GEMINI_GENERATION_BUDGET_SECONDS", "40")))
+    request_timeout = max(2.0, float(os.getenv("GEMINI_REQUEST_TIMEOUT_SECONDS", "28")))
+    first_token_timeout = max(0.5, float(os.getenv("GEMINI_FIRST_TOKEN_TIMEOUT_SECONDS", "12")))
+    fallback_request_timeout = max(
+        2.0, float(os.getenv("GEMINI_FALLBACK_REQUEST_TIMEOUT_SECONDS", "15"))
+    )
+    fallback_first_token_timeout = max(
+        0.5, float(os.getenv("GEMINI_FALLBACK_FIRST_TOKEN_TIMEOUT_SECONDS", "6"))
+    )
     deadline = time.monotonic() + budget_seconds
 
     for model_index, candidate_model in enumerate(models):
-        # Retry the first model only when the API promptly returns a transient 5xx/429.
+        # Retry the primary model only when it promptly returns a transient 5xx/429.
         attempts = 2 if model_index == 0 else 1
+        model_request_timeout = request_timeout if model_index == 0 else fallback_request_timeout
+        model_first_token_timeout = first_token_timeout if model_index == 0 else fallback_first_token_timeout
         for attempt in range(attempts):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -271,7 +279,7 @@ async def gemini_stream_generate_with_fallback(
                 if on_text is not None:
                     await on_text(piece)
 
-            attempt_budget = min(request_timeout, remaining)
+            attempt_budget = min(model_request_timeout, remaining)
             attempt_deadline = time.monotonic() + attempt_budget
             generation_task = asyncio.create_task(
                 gemini_stream_generate(
@@ -282,7 +290,7 @@ async def gemini_stream_generate_with_fallback(
             try:
                 done, _ = await asyncio.wait(
                     {generation_task, first_token_waiter},
-                    timeout=min(first_token_timeout, attempt_budget),
+                    timeout=min(model_first_token_timeout, attempt_budget),
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if generation_task in done:
@@ -295,7 +303,7 @@ async def gemini_stream_generate_with_fallback(
                     await asyncio.gather(generation_task, return_exceptions=True)
                     raise asyncio.TimeoutError(
                         f"{candidate_model} did not send a first token within "
-                        f"{first_token_timeout:.1f} seconds"
+                        f"{model_first_token_timeout:.1f} seconds"
                     )
 
                 remaining_attempt = attempt_deadline - time.monotonic()
@@ -320,8 +328,8 @@ async def gemini_stream_generate_with_fallback(
                     raise
 
                 failures.append(f"{candidate_model}: {message[:160]}")
-                # Don't spend another full timeout retrying a slow model. Retry only
-                # a promptly reported transient API status, then move to fallback.
+                # Avoid another full attempt when the model fails to start. For actual
+                # 429/5xx responses, one short retry precedes model fallback.
                 if transient_status and attempt == 0:
                     await asyncio.sleep(0.25)
                     continue
@@ -341,8 +349,10 @@ async def gemini_stream_generate_with_fallback(
     elapsed = time.perf_counter() - generation_started
     raise RuntimeError(
         f"Gemini could not complete the answer within {budget_seconds:.0f} seconds "
-        f"(elapsed {elapsed:.1f}s). Each model gets a {first_token_timeout:.0f}s first-token window. "
-        "The service may be overloaded; please retry shortly. " + detail
+        f"(elapsed {elapsed:.1f}s). The primary model gets a "
+        f"{first_token_timeout:.0f}s first-token window and fallbacks get "
+        f"{fallback_first_token_timeout:.0f}s. The service may be overloaded; "
+        "please retry shortly. " + detail
     )
 
 

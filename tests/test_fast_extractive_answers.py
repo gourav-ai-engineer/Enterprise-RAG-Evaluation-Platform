@@ -46,3 +46,17 @@ def test_fast_answer_falls_back_if_sentence_cannot_be_cited() -> None:
     # The helper may only return sentences that can be traced back to retrieved text.
     answer = gemini_main.fast_extractive_answer("Who is Gourav?", results)
     assert answer == "Gourav is an AI/ML engineer. [Source 1]"
+
+
+def test_comparisons_are_not_answered_extractive() -> None:
+    results = [
+        {
+            "filename": "rag.pdf",
+            "page_start": 1,
+            "page_end": 1,
+            "text": "BM25 is a lexical retrieval algorithm. TF-IDF uses term frequency and inverse document frequency.",
+        }
+    ]
+    assert gemini_main.fast_extractive_answer(
+        "Which is better, BM25 or TF-IDF?", results
+    ) is None

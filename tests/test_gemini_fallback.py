@@ -33,7 +33,7 @@ def test_gemini_overload_retries_then_falls_back(monkeypatch) -> None:
 def test_non_transient_gemini_error_does_not_retry(monkeypatch) -> None:
     calls: list[str] = []
 
-    async def fake_generate(model: str, question: str, results: list[dict]):
+    async def fake_generate(model: str, question: str, results: list[dict], on_text=None):
         calls.append(model)
         raise RuntimeError("Gemini HTTP 403: permission denied")
 

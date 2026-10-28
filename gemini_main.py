@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -218,6 +219,48 @@ async def gemini_stream_generate(model: str, question: str, results: list[dict])
     return answer, ttft_ms, generation_ms, chunks
 
 
+async def gemini_stream_generate_with_fallback(
+    model: str, question: str, results: list[dict]
+) -> tuple[str, float, float, int, str]:
+    """Retry transient Gemini errors, then try the other supported Flash models."""
+    requested = resolve_gemini_model(model)
+    models = [requested] + [item for item in GEMINI_MODELS if item != requested]
+    failures: list[str] = []
+
+    for candidate_model in models:
+        for attempt in range(2):
+            try:
+                answer, ttft_ms, generation_ms, chunks = await gemini_stream_generate(
+                    candidate_model, question, results
+                )
+                return answer, ttft_ms, generation_ms, chunks, candidate_model
+            except Exception as exc:
+                message = str(exc)
+                match = re.search(r"Gemini HTTP (\d{3})", message)
+                status = int(match.group(1)) if match else None
+                transient = (
+                    status in {408, 429, 500, 502, 503, 504}
+                    or isinstance(exc, (httpx.TimeoutException, httpx.NetworkError))
+                )
+                # 404 can indicate a model that is unavailable to this API project.
+                if not transient and status != 404:
+                    raise
+
+                failures.append(f"{candidate_model}: {message[:220]}")
+                if transient and attempt == 0:
+                    # Google's guidance recommends exponential backoff for transient 5xx/429 errors.
+                    await asyncio.sleep(1.0)
+                    continue
+                break
+
+    detail = " | ".join(failures[-3:])
+    raise RuntimeError(
+        "All configured Gemini Flash models failed after retry/fallback. "
+        "The Gemini service may be overloaded; try again shortly. "
+        + detail
+    )
+
+
 @app.get("/api/runtime")
 async def runtime():
     return {"provider": "gemini", "models": GEMINI_MODELS, "default_model": DEFAULT_GEMINI_MODEL, "streaming": True}
@@ -233,7 +276,8 @@ async def ask_stream(body: StreamAskRequest):
         candidates: list[dict] = []
         results: list[dict] = []
         answerable = False
-        model = body.model or DEFAULT_GEMINI_MODEL
+        model = resolve_gemini_model(body.model or DEFAULT_GEMINI_MODEL)
+        model_used = model
         yield sse("stage", {"id": "scope", "label": "Preparing scope", "detail": "Loading selected documents"})
         try:
             rows = core.load_chunks(document_ids=scope) if scope else core.load_chunks()
@@ -256,9 +300,12 @@ async def ask_stream(body: StreamAskRequest):
                 yield sse("stage", {"id": "generation", "label": "Generating grounded answer", "detail": f"Gemini · {model} · streaming response", "active": True})
                 gen_started = time.perf_counter()
                 try:
-                    answer, ttft_ms, generation_ms, chunks = await gemini_stream_generate(model, body.question, results)
+                    answer, ttft_ms, generation_ms, chunks, model_used = await gemini_stream_generate_with_fallback(
+                        model, body.question, results
+                    )
                     mode = "gemini"
-                    yield sse("stage", {"id": "generation", "label": "Generating grounded answer", "detail": f"Completed · TTFT {ttft_ms:.0f} ms · {generation_ms:.0f} ms total · {chunks} chunks", "done": True})
+                    fallback_note = f" · fallback model {model_used}" if model_used != model else ""
+                    yield sse("stage", {"id": "generation", "label": "Generating grounded answer", "detail": f"Completed{fallback_note} · TTFT {ttft_ms:.0f} ms · {generation_ms:.0f} ms total · {chunks} chunks", "done": True})
                 except Exception as exc:
                     answer = f"Gemini generation failed: {str(exc)}"
                     mode = "gemini_error"
@@ -270,7 +317,7 @@ async def ask_stream(body: StreamAskRequest):
                 "answer": answer,
                 "mode": mode,
                 "provider": "gemini",
-                "model": model if answerable else None,
+                "model": model_used if answerable else None,
                 "answerable": answerable,
                 "scope_document_ids": scope or [],
                 "evidence_coverage": round(core.evidence_coverage(body.question, results), 4),

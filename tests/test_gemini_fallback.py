@@ -26,8 +26,8 @@ def test_gemini_overload_retries_then_falls_back(monkeypatch) -> None:
         )
     )
 
-    assert result == ("grounded answer", 12.0, 30.0, 2, "gemini-3.6-flash")
-    assert calls == ["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.6-flash"]
+    assert result == ("grounded answer", 12.0, 30.0, 2, "gemini-3.5-flash-lite")
+    assert calls == ["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite"]
 
 
 def test_non_transient_gemini_error_does_not_retry(monkeypatch) -> None:

@@ -48,3 +48,12 @@ def test_answerable_questions_do_not_use_local_extractive_generation() -> None:
     assert "def fast_extractive_answer" not in source
     assert "extractive_fast" not in source
     assert "gemini_stream_generate_with_fallback(" in source
+
+
+
+def test_generation_timeouts_are_explicitly_bounded() -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "gemini_main.py").read_text(encoding="utf-8")
+    assert 'GEMINI_GENERATION_BUDGET_SECONDS", "25"' in source
+    assert 'GEMINI_REQUEST_TIMEOUT_SECONDS", "10"' in source
+    assert 'GEMINI_FIRST_TOKEN_TIMEOUT_SECONDS", "4"' in source

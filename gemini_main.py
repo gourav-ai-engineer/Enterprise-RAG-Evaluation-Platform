@@ -176,7 +176,7 @@ async def gemini_stream_generate(
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": [{"role": "user", "parts": [{"text": user}]}],
         "generationConfig": {
-            "maxOutputTokens": 256,
+            "maxOutputTokens": 160,
             # Simple factual RAG questions do not need deep reasoning.
             "thinkingConfig": {
                 "thinkingLevel": "minimal" if model in {
@@ -239,16 +239,20 @@ async def gemini_stream_generate_with_fallback(
     on_text: Callable[[str], Awaitable[None]] | None = None,
     on_reset: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[str, float, float, int, str]:
-    """Stream partial answer text, retry briefly, and cap total generation time."""
+    """Bound generation latency and fail over when a model is slow to start."""
     requested = resolve_gemini_model(model)
     models = [requested] + [item for item in GEMINI_MODELS if item != requested]
     failures: list[str] = []
-    budget_seconds = max(10.0, float(os.getenv("GEMINI_GENERATION_BUDGET_SECONDS", "60")))
-    request_timeout = max(5.0, float(os.getenv("GEMINI_REQUEST_TIMEOUT_SECONDS", "35")))
+    generation_started = time.perf_counter()
+    first_token_ms: float | None = None
+
+    budget_seconds = max(8.0, float(os.getenv("GEMINI_GENERATION_BUDGET_SECONDS", "25")))
+    request_timeout = max(1.0, float(os.getenv("GEMINI_REQUEST_TIMEOUT_SECONDS", "10")))
+    first_token_timeout = max(0.5, float(os.getenv("GEMINI_FIRST_TOKEN_TIMEOUT_SECONDS", "4")))
     deadline = time.monotonic() + budget_seconds
 
     for model_index, candidate_model in enumerate(models):
-        # Retry the initially selected model once; try each fallback only once.
+        # Retry the first model only when the API promptly returns a transient 5xx/429.
         attempts = 2 if model_index == 0 else 1
         for attempt in range(attempts):
             remaining = deadline - time.monotonic()
@@ -257,41 +261,88 @@ async def gemini_stream_generate_with_fallback(
             if (model_index > 0 or attempt > 0) and on_reset is not None:
                 await on_reset(candidate_model)
 
-            try:
-                result = await asyncio.wait_for(
-                    gemini_stream_generate(
-                        candidate_model, question, results, on_text=on_text
-                    ),
-                    timeout=min(remaining, request_timeout),
+            first_text = asyncio.Event()
+
+            async def relay_text(piece: str) -> None:
+                nonlocal first_token_ms
+                if first_token_ms is None:
+                    first_token_ms = (time.perf_counter() - generation_started) * 1000
+                first_text.set()
+                if on_text is not None:
+                    await on_text(piece)
+
+            attempt_budget = min(request_timeout, remaining)
+            attempt_deadline = time.monotonic() + attempt_budget
+            generation_task = asyncio.create_task(
+                gemini_stream_generate(
+                    candidate_model, question, results, on_text=relay_text
                 )
-                answer, ttft_ms, generation_ms, chunks = result
-                return answer, ttft_ms, generation_ms, chunks, candidate_model
+            )
+            first_token_waiter = asyncio.create_task(first_text.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    {generation_task, first_token_waiter},
+                    timeout=min(first_token_timeout, attempt_budget),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if generation_task in done:
+                    answer, _, _, chunks = await generation_task
+                    elapsed_ms = (time.perf_counter() - generation_started) * 1000
+                    return answer, first_token_ms or elapsed_ms, elapsed_ms, chunks, candidate_model
+
+                if first_token_waiter not in done:
+                    generation_task.cancel()
+                    await asyncio.gather(generation_task, return_exceptions=True)
+                    raise asyncio.TimeoutError(
+                        f"{candidate_model} did not send a first token within "
+                        f"{first_token_timeout:.1f} seconds"
+                    )
+
+                remaining_attempt = attempt_deadline - time.monotonic()
+                if remaining_attempt <= 0:
+                    raise asyncio.TimeoutError(f"{candidate_model} request timed out")
+                answer, _, _, chunks = await asyncio.wait_for(
+                    generation_task, timeout=remaining_attempt
+                )
+                elapsed_ms = (time.perf_counter() - generation_started) * 1000
+                return answer, first_token_ms or elapsed_ms, elapsed_ms, chunks, candidate_model
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
-                message = str(exc)
+                message = str(exc) or type(exc).__name__
                 match = re.search(r"Gemini HTTP (\d{3})", message)
                 status = int(match.group(1)) if match else None
-                transient = (
-                    status in {408, 429, 500, 502, 503, 504}
-                    or isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, asyncio.TimeoutError))
-                )
-                # Retry only transient issues or unavailable models. Do not loop on auth/config errors.
-                if not transient and status != 404:
+                is_timeout = isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException))
+                is_network_error = isinstance(exc, httpx.NetworkError)
+                transient_status = status in {408, 429, 500, 502, 503, 504}
+                unavailable_model = status == 404
+                if not (is_timeout or is_network_error or transient_status or unavailable_model):
                     raise
 
-                failures.append(f"{candidate_model}: {message[:180] or type(exc).__name__}")
-                if transient and model_index == 0 and attempt == 0:
-                    await asyncio.sleep(0.5)
+                failures.append(f"{candidate_model}: {message[:160]}")
+                # Don't spend another full timeout retrying a slow model. Retry only
+                # a promptly reported transient API status, then move to fallback.
+                if transient_status and attempt == 0:
+                    await asyncio.sleep(0.25)
                     continue
                 break
+            finally:
+                if not generation_task.done():
+                    generation_task.cancel()
+                    await asyncio.gather(generation_task, return_exceptions=True)
+                if not first_token_waiter.done():
+                    first_token_waiter.cancel()
+                    await asyncio.gather(first_token_waiter, return_exceptions=True)
 
         if time.monotonic() >= deadline:
             break
 
     detail = " | ".join(failures[-3:])
+    elapsed = time.perf_counter() - generation_started
     raise RuntimeError(
-        f"Gemini could not complete the answer within {budget_seconds:.0f} seconds. "
-        "The service may be overloaded; please retry shortly. "
-        + detail
+        f"Gemini could not complete the answer within {budget_seconds:.0f} seconds "
+        f"(elapsed {elapsed:.1f}s). Each model gets a {first_token_timeout:.0f}s first-token window. "
+        "The service may be overloaded; please retry shortly. " + detail
     )
 
 

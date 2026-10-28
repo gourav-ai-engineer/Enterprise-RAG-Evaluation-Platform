@@ -304,40 +304,54 @@ def audit_logs(limit: int = 50) -> dict[str, Any]:
 
 migrate()
 
+# Keep query-trace capture, but do not add a telemetry strip to the user-facing UI.
 ENTERPRISE_HTML = ui.HTML.replace(
-    '<main class="main">',
-    '<main class="main"><section id="enterpriseBar" style="margin-bottom:14px;border:1px solid #223049;background:#0d1624;border-radius:12px;padding:12px 14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
-    '<b style="font-size:12px">Enterprise telemetry</b>'
-    '<span id="eDocs" style="color:#8b99ad;font-size:11px">Docs —</span>'
-    '<span id="eQueries" style="color:#8b99ad;font-size:11px">Queries —</span>'
-    '<span id="eCoverage" style="color:#8b99ad;font-size:11px">Evidence —</span>'
-    '<span id="eLatency" style="color:#8b99ad;font-size:11px">Latency —</span>'
-    '<span id="eCache" style="color:#8b99ad;font-size:11px">Cache —</span>'
-    '<a href="/docs" target="_blank" style="margin-left:auto;border:1px solid #223049;background:#101b2b;color:#d4deed;padding:6px 9px;border-radius:7px;text-decoration:none;font-size:11px">API</a>'
-    '</section>'
-)
-
-ENTERPRISE_HTML = ENTERPRISE_HTML.replace(
     '</body></html>',
     r'''<script>
-async function enterpriseTelemetry(){try{const r=await fetch('/api/enterprise/overview');if(!r.ok)return;const d=await r.json();
-const q=document.getElementById('eQueries'),d1=document.getElementById('eDocs'),c=document.getElementById('eCoverage'),l=document.getElementById('eLatency'),ca=document.getElementById('eCache');
-if(d1)d1.textContent=`Docs ${d.indexed_documents}/${d.documents}`;if(q)q.textContent=`Queries ${d.queries}`;if(c)c.textContent=`Evidence ${(d.avg_evidence_coverage*100).toFixed(0)}%`;if(l)l.textContent=`Avg ${d.avg_latency_ms.toFixed(0)} ms`;if(ca)ca.textContent=`Cache ${d.retrieval_cache_hits}H/${d.retrieval_cache_misses}M · ${d.ingestion_cache_entries}I`;}catch{}}
-enterpriseTelemetry();setInterval(enterpriseTelemetry,5000);
 (function(){
 const originalFetch=window.fetch;
 window.fetch=async function(input,init){
  const url=typeof input==='string'?input:input.url;
- if(!url.endsWith('/api/ask/stream')) return originalFetch.apply(this,arguments);
- let request={};try{request=JSON.parse((init&&init.body)||'{}')}catch{}
- let beforeHits=0;try{beforeHits=(await (await originalFetch('/api/cache/stats')).json()).retrieval_cache_hits||0}catch{}
- const response=await originalFetch.apply(this,arguments);const clone=response.clone();
- (async()=>{try{const reader=clone.body.getReader();const decoder=new TextDecoder();let buf='',result=null;for(;;){const {value,done}=await reader.read();if(done)break;buf+=decoder.decode(value,{stream:true});const blocks=buf.split('\n\n');buf=blocks.pop()||'';for(const block of blocks){const line=block.split('\n').find(x=>x.startsWith('data:'));if(!line)continue;try{const data=JSON.parse(line.slice(5).trim());if(block.startsWith('event: result'))result=data}catch{}}}if(result){let afterHits=beforeHits;try{afterHits=(await (await originalFetch('/api/cache/stats')).json()).retrieval_cache_hits||beforeHits}catch{}await originalFetch('/api/traces',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...result,cache_hit:afterHits>beforeHits})});enterpriseTelemetry();}}catch{}})();return response;
+ if(!url || !url.endsWith('/api/ask/stream')) return originalFetch.apply(this,arguments);
+ let beforeHits=0;
+ try{beforeHits=(await (await originalFetch('/api/cache/stats')).json()).retrieval_cache_hits||0}catch{}
+ const response=await originalFetch.apply(this,arguments);
+ const clone=response.clone();
+ (async()=>{
+   try{
+     const reader=clone.body.getReader();
+     const decoder=new TextDecoder();
+     let buf='',result=null;
+     for(;;){
+       const {value,done}=await reader.read();
+       if(done)break;
+       buf+=decoder.decode(value,{stream:true});
+       const blocks=buf.split('\n\n');buf=blocks.pop()||'';
+       for(const block of blocks){
+         const line=block.split('\n').find(x=>x.startsWith('data:'));
+         if(!line)continue;
+         try{
+           const data=JSON.parse(line.slice(5).trim());
+           if(block.startsWith('event: result'))result=data;
+         }catch{}
+       }
+     }
+     if(result){
+       let afterHits=beforeHits;
+       try{afterHits=(await (await originalFetch('/api/cache/stats')).json()).retrieval_cache_hits||beforeHits}catch{}
+       await originalFetch('/api/traces',{
+         method:'POST',
+         headers:{'Content-Type':'application/json'},
+         body:JSON.stringify({...result,cache_hit:afterHits>beforeHits})
+       });
+     }
+   }catch{}
+ })();
+ return response;
 };
 })();
 </script></body></html>'''
 )
-
 
 app.routes[:] = [r for r in app.routes if getattr(r, "path", None) != "/"]
 

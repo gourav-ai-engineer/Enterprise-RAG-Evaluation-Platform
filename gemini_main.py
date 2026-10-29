@@ -107,30 +107,55 @@ def evidence_groups(results: list[dict]) -> list[dict]:
 
 
 def candidate_matches_question(question: str, item: dict) -> bool:
-    """Require meaningful query overlap, not merely a shared name or footer."""
-    query_terms = set(core.content_tokens(question))
-    if not query_terms or float(item.get("score", 0.0)) <= 0:
-        return False
-    evidence_terms = set(core.content_tokens(item.get("text", "")))
-    return len(query_terms & evidence_terms) >= core.minimum_query_overlap(question)
+    """Check that a passage contains at least one query concept."""
+    return (
+        float(item.get("score", 0.0)) > 0
+        and core.query_term_match_score(question, str(item.get("text", ""))) > 0
+    )
 
 
 def diversify_reranked_results(
     question: str,
     ranked_results: list[dict],
     top_k: int,
+    all_rows: list | None = None,
 ) -> list[dict]:
-    """Reserve one relevant passage per document before filling global top-k slots."""
+    """Select topic-relevant passages from documents matching the query as a whole."""
+    source_rows = all_rows if all_rows is not None else ranked_results
+    relevant_docs = core.relevant_document_ids(question, source_rows)
+    if not relevant_docs:
+        return []
+
+    eligible = [
+        item for item in ranked_results
+        if str(item.get("document_id") or item.get("filename", "")) in relevant_docs
+        and candidate_matches_question(question, item)
+    ]
     best_by_document: dict[str, dict] = {}
-    for item in ranked_results:
+    for item in eligible:
         document_id = str(item.get("document_id") or item.get("filename", ""))
-        if document_id not in best_by_document and candidate_matches_question(question, item):
+        current = best_by_document.get(document_id)
+        key = (
+            core.query_term_match_score(question, str(item.get("text", ""))),
+            float(item.get("rerank_score", 0.0)),
+            float(item.get("score", 0.0)),
+        )
+        current_key = (
+            core.query_term_match_score(question, str(current.get("text", ""))),
+            float(current.get("rerank_score", 0.0)),
+            float(current.get("score", 0.0)),
+        ) if current is not None else None
+        if current is None or key > current_key:
             best_by_document[document_id] = item
 
-    document_winners = [
-        item for item in ranked_results
-        if best_by_document.get(str(item.get("document_id") or item.get("filename", ""))) is item
-    ]
+    document_winners = sorted(
+        best_by_document.values(),
+        key=lambda item: (
+            -core.query_term_match_score(question, str(item.get("text", ""))),
+            -float(item.get("rerank_score", 0.0)),
+            -float(item.get("score", 0.0)),
+        ),
+    )
     effective_k = min(10, max(top_k, len(document_winners)))
     selected: list[dict] = []
     selected_ids: set[str] = set()
@@ -139,11 +164,11 @@ def diversify_reranked_results(
         if len(selected) >= effective_k:
             break
         chunk_id = str(item.get("chunk_id", ""))
-        if chunk_id not in selected_ids:
-            selected.append(item)
-            selected_ids.add(chunk_id)
+        selected.append(item)
+        selected_ids.add(chunk_id)
 
-    for item in ranked_results:
+    # Fill only from source documents that independently match the full query.
+    for item in eligible:
         if len(selected) >= effective_k:
             break
         chunk_id = str(item.get("chunk_id", ""))
@@ -461,7 +486,7 @@ async def ask_stream(body: StreamAskRequest):
             t = time.perf_counter()
             if multi_document:
                 reranked = core.rerank(search_question, candidates, len(candidates))
-                results = diversify_reranked_results(search_question, reranked, body.top_k)
+                results = diversify_reranked_results(search_question, reranked, body.top_k, all_rows=rows)
             else:
                 results = core.rerank(search_question, candidates, body.top_k)
             rerank_ms = (time.perf_counter() - t) * 1000

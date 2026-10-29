@@ -107,13 +107,12 @@ def evidence_groups(results: list[dict]) -> list[dict]:
 
 
 def candidate_matches_question(question: str, item: dict) -> bool:
-    """Require actual question-term overlap before counting a source as relevant."""
+    """Require meaningful query overlap, not merely a shared name or footer."""
     query_terms = set(core.content_tokens(question))
     if not query_terms or float(item.get("score", 0.0)) <= 0:
         return False
     evidence_terms = set(core.content_tokens(item.get("text", "")))
-    minimum_overlap = max(1, (len(query_terms) + 3) // 4)
-    return len(query_terms & evidence_terms) >= minimum_overlap
+    return len(query_terms & evidence_terms) >= core.minimum_query_overlap(question)
 
 
 def diversify_reranked_results(
@@ -432,15 +431,26 @@ async def ask_stream(body: StreamAskRequest):
             rows = core.load_chunks(document_ids=scope) if scope else core.load_chunks()
             scoped_document_ids = sorted({str(row["document_id"]) for row in rows})
             multi_document = len(scoped_document_ids) > 1
+            search_question = core.correct_query_terms(
+                body.question, [str(row["text"]) for row in rows]
+            )
+            correction_note = (
+                f" · spelling normalized for retrieval: {search_question}"
+                if search_question.casefold() != body.question.casefold()
+                else ""
+            )
             yield sse("stage", {
                 "id": "retrieval",
                 "label": "Hybrid retrieval",
-                "detail": f"Searching {len(rows)} indexed chunks across {len(scoped_document_ids)} documents with BM25 + TF-IDF",
+                "detail": (
+                    f"Searching {len(rows)} indexed chunks across {len(scoped_document_ids)} "
+                    f"documents with BM25 + TF-IDF{correction_note}"
+                ),
                 "active": True,
             })
             t = time.perf_counter()
             candidates = core.hybrid_retrieve(
-                body.question,
+                search_question,
                 rows,
                 max(body.top_k, core.RETRIEVAL_CANDIDATES),
                 diversify_documents=multi_document,
@@ -450,12 +460,12 @@ async def ask_stream(body: StreamAskRequest):
             yield sse("stage", {"id": "rerank", "label": "Reranking evidence", "detail": "Ranking relevant passages while preserving source diversity", "active": True})
             t = time.perf_counter()
             if multi_document:
-                reranked = core.rerank(body.question, candidates, len(candidates))
-                results = diversify_reranked_results(body.question, reranked, body.top_k)
+                reranked = core.rerank(search_question, candidates, len(candidates))
+                results = diversify_reranked_results(search_question, reranked, body.top_k)
             else:
-                results = core.rerank(body.question, candidates, body.top_k)
+                results = core.rerank(search_question, candidates, body.top_k)
             rerank_ms = (time.perf_counter() - t) * 1000
-            answerable = core.has_sufficient_evidence(body.question, results)
+            answerable = core.has_sufficient_evidence(search_question, results)
             yield sse("stage", {"id": "rerank", "label": "Reranking evidence", "detail": f"Selected {len(results)} evidence chunks · {rerank_ms:.1f} ms", "done": True})
             if not answerable:
                 answer = core.ABSTAIN_MESSAGE
@@ -512,7 +522,7 @@ async def ask_stream(body: StreamAskRequest):
                 "model": model_used if mode == "gemini" else None,
                 "answerable": answerable,
                 "scope_document_ids": scoped_document_ids,
-                "evidence_coverage": round(core.evidence_coverage(body.question, results), 4),
+                "evidence_coverage": round(core.evidence_coverage(search_question, results), 4),
                 "citations": compact_citations(results) if answerable else [],
                 "evidence_groups": evidence_groups(results) if answerable else [],
                 "retrieved": results,

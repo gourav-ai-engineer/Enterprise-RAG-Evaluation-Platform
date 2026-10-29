@@ -585,15 +585,34 @@ def hybrid_retrieve(
     selected = ranked[:k]
     if diversify_documents and k > 1:
         relevant_docs = relevant_document_ids(search_query, rows)
+        # Preserve documents that rank strongly in dense semantic search, even if
+        # their phrasing differs from the query. Keep this signal stricter for
+        # profile questions, where an unrelated PDF may repeat the person's name.
+        if profile_query_intent(search_query) is None:
+            dense_threshold = float(os.getenv("DENSE_SOURCE_RELEVANCE_THRESHOLD", "0.38"))
+            dense_rank_limit = max(4, min(10, k))
+            relevant_docs.update(
+                str(entry["row"]["document_id"])
+                for entry in ranked
+                if (
+                    entry["dense_rank"] is not None
+                    and entry["dense_rank"] <= dense_rank_limit
+                    and entry["dense"] >= dense_threshold
+                )
+            )
         if relevant_docs:
             grouped: dict[str, list[dict[str, Any]]] = {}
             for entry in ranked:
                 row = entry["row"]
                 document_id = str(row["document_id"])
-                if (
-                    document_id in relevant_docs
-                    and query_term_match_score(search_query, str(row["text"])) > 0
-                ):
+                lexical_match = query_term_match_score(search_query, str(row["text"])) > 0
+                semantic_match = (
+                    profile_query_intent(search_query) is None
+                    and entry["dense_rank"] is not None
+                    and entry["dense_rank"] <= max(4, min(10, k))
+                    and entry["dense"] >= float(os.getenv("DENSE_SOURCE_RELEVANCE_THRESHOLD", "0.38"))
+                )
+                if document_id in relevant_docs and (lexical_match or semantic_match):
                     grouped.setdefault(document_id, []).append(entry)
 
             winners = []

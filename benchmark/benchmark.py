@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import statistics
 import time
 import uuid
@@ -154,11 +155,11 @@ def main() -> None:
             "embedding_model": core.dense_retrieval.model_name(),
             "fusion": {
                 "method": "weighted reciprocal rank fusion",
-                "rrf_k": int(__import__("os").getenv("HYBRID_RRF_K", "60")),
+                "rrf_k": int(os.getenv("HYBRID_RRF_K", "60")),
                 "weights": {
-                    "bm25": float(__import__("os").getenv("HYBRID_BM25_WEIGHT", "0.35")),
-                    "tfidf": float(__import__("os").getenv("HYBRID_TFIDF_WEIGHT", "0.15")),
-                    "dense": float(__import__("os").getenv("HYBRID_DENSE_WEIGHT", "0.50")),
+                    "bm25": float(os.getenv("HYBRID_BM25_WEIGHT", "0.35")),
+                    "tfidf": float(os.getenv("HYBRID_TFIDF_WEIGHT", "0.15")),
+                    "dense": float(os.getenv("HYBRID_DENSE_WEIGHT", "0.50")),
                 },
             },
             "results": results,

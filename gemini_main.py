@@ -191,11 +191,11 @@ def is_summary_request(question: str) -> bool:
 
 
 METHOD_INTENT_RE = re.compile(
-    r"\\b(?:explain|describe|discuss|outline)\\b.{0,100}"
-    r"\\b(?:main|primary|proposed|key)?\\s*"
-    r"(?:method(?:ology)?|approach|technique|framework|process|algorithm)\\b"
-    r"|\\b(?:main|primary|proposed|key)\\s+"
-    r"(?:method(?:ology)?|approach|technique|framework|process|algorithm)\\b",
+    r"\b(?:explain|describe|discuss|outline)\b.{0,100}"
+    r"\b(?:main|primary|proposed|key)?\s*"
+    r"(?:method(?:ology)?|approach|technique|framework|process|algorithm)\b"
+    r"|\b(?:main|primary|proposed|key)\s+"
+    r"(?:method(?:ology)?|approach|technique|framework|process|algorithm)\b",
     re.IGNORECASE,
 )
 

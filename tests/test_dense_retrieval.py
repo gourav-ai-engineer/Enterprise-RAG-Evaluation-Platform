@@ -122,3 +122,37 @@ def test_dense_cosine_helper_handles_zero_vectors() -> None:
     )
 
     assert np.allclose(scores, [1.0, 0.0, 0.0])
+
+
+def test_dense_relevance_can_pass_evidence_gate_for_a_paraphrase() -> None:
+    result = [{
+        "chunk_id": "semantic-1",
+        "document_id": "transport",
+        "filename": "transport.pdf",
+        "page_start": 1,
+        "page_end": 1,
+        "text": "Automobiles provide road-based personal mobility for commuters.",
+        "score": 1.0,
+        "dense": 0.91,
+        "dense_rank": 1,
+    }]
+
+    assert not (set(core.content_tokens("What is a practical way to commute?"))
+                & set(core.content_tokens(result[0]["text"])))
+    assert core.has_sufficient_evidence("What is a practical way to commute?", result)
+
+
+def test_dense_relevance_alone_does_not_support_a_name_only_query() -> None:
+    result = [{
+        "chunk_id": "footer-1",
+        "document_id": "seminar",
+        "filename": "QFC_Seminar.pdf",
+        "page_start": 2,
+        "page_end": 2,
+        "text": "An unrelated presentation discusses a mathematical method.",
+        "score": 1.0,
+        "dense": 0.99,
+        "dense_rank": 1,
+    }]
+
+    assert not core.has_sufficient_evidence("Gourav", result)

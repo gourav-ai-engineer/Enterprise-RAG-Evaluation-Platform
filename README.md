@@ -15,7 +15,7 @@ Content-addressed PDF + ingestion cache
    ↓
 Page-aware extraction + overlapping chunks
    ↓
-BM25 + TF-IDF + dense BGE embeddings, fused with weighted Reciprocal Rank Fusion (RRF)
+Sparse wording (BM25 + TF-IDF) + dense semantic embeddings → weighted RRF
    ↓
 Reranking + evidence/answerability gate
    ↓
@@ -99,6 +99,23 @@ Response includes `sha256`, `duplicate`, `cache_hit`, page count and chunk count
 
 ### Retrieve / Ask / Evaluate
 The underlying retrieval, grounded Q&A and evaluation APIs remain available through the composed application stack.
+
+## Retrieval configuration
+
+The default dense model is `BAAI/bge-small-en-v1.5`, a small English embedding model executed locally through FastEmbed/ONNX on CPU. The model files download on first use and are cached under `data/models/fastembed` by default. Keep the `data/` volume persistent. New PDF uploads attempt to pre-index vectors; existing documents with missing vectors are embedded on demand.
+
+```text
+DENSE_EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
+DENSE_EMBEDDING_THREADS=2
+HYBRID_BM25_WEIGHT=0.35
+HYBRID_TFIDF_WEIGHT=0.15
+HYBRID_DENSE_WEIGHT=0.50
+HYBRID_RRF_K=60
+DENSE_ANSWERABILITY_THRESHOLD=0.42
+DENSE_SOURCE_RELEVANCE_THRESHOLD=0.38
+```
+
+The three ranking weights are normalized before weighted Reciprocal Rank Fusion. Tune weights and semantic thresholds using a labeled query set, not intuition alone. Dense retrieval improves paraphrase matching but may also surface semantically related false positives, so the evidence gate and regression tests are important.
 
 ## Gemini configuration
 

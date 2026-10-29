@@ -52,31 +52,149 @@ def content_tokens(text: str) -> list[str]:
     return [t for t in tokens(text) if t not in STOPWORDS and len(t) > 1]
 
 
+def _one_edit_apart(left: str, right: str) -> bool:
+    """Return True when two tokens differ by at most one insertion/deletion/substitution."""
+    if left == right:
+        return True
+    if abs(len(left) - len(right)) > 1:
+        return False
+    i = j = edits = 0
+    while i < len(left) and j < len(right):
+        if left[i] == right[j]:
+            i += 1
+            j += 1
+            continue
+        edits += 1
+        if edits > 1:
+            return False
+        if len(left) > len(right):
+            i += 1
+        elif len(right) > len(left):
+            j += 1
+        else:
+            i += 1
+            j += 1
+    return edits + (len(left) - i) + (len(right) - j) <= 1
+
+
+def correct_query_terms(query: str, corpus_texts: list[str]) -> str:
+    """Correct one-character spelling mistakes using words actually present in the corpus."""
+    vocabulary_counts = Counter(
+        term
+        for text in corpus_texts
+        for term in content_tokens(text)
+    )
+    if not vocabulary_counts:
+        return query
+
+    corrected = query
+    for term in dict.fromkeys(content_tokens(query)):
+        if term in vocabulary_counts or len(term) < 5:
+            continue
+        options = [
+            candidate for candidate in vocabulary_counts
+            if candidate[0] == term[0]
+            and abs(len(candidate) - len(term)) <= 1
+            and _one_edit_apart(term, candidate)
+        ]
+        if not options:
+            continue
+        best = sorted(
+            options,
+            key=lambda candidate: (
+                -vocabulary_counts[candidate],
+                abs(len(candidate) - len(term)),
+                candidate,
+            ),
+        )[0]
+        corrected = re.sub(rf"\\b{re.escape(term)}\\b", best, corrected, flags=re.IGNORECASE)
+    return corrected
+
+
+def minimum_query_overlap(question: str) -> int:
+    """Require more than a shared name for a multi-concept query."""
+    count = len(set(content_tokens(question)))
+    if count == 0:
+        return 1
+    if count == 1:
+        return 1
+    return max(2, math.ceil(count * 0.34))
+
+
 def clean_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text or "").strip()
     return re.sub(r"(?<=\w)-\s+(?=\w)", "", text)
 
 
+def clean_page_text(text: str) -> str:
+    """Normalize PDF extraction while preserving line breaks for header/footer cleanup."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"(?<=\w)-\s*\n\s*(?=\w)", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", text)
+    return text.strip()
+
+
+def _boilerplate_key(line: str) -> str:
+    normalized = clean_text(line).casefold()
+    normalized = re.sub(r"\d+", "#", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def remove_repeated_page_boilerplate(pages: list[str]) -> list[str]:
+    """Remove short repeated PDF headers/footers, normalizing changing page numbers."""
+    if len(pages) < 3:
+        return [clean_page_text(page) for page in pages]
+
+    page_lines = [clean_page_text(page).splitlines() for page in pages]
+    page_occurrences: Counter[str] = Counter()
+    for lines in page_lines:
+        page_occurrences.update({
+            _boilerplate_key(line)
+            for line in lines
+            if clean_text(line) and len(clean_text(line)) <= 120
+        })
+
+    threshold = max(3, math.ceil(len(pages) * 0.35))
+    repeated = {
+        key for key, count in page_occurrences.items()
+        if count >= threshold and len(key.split()) <= 20
+    }
+
+    cleaned_pages = []
+    for lines in page_lines:
+        kept = [
+            line for line in lines
+            if not clean_text(line) or _boilerplate_key(line) not in repeated
+        ]
+        cleaned_pages.append("\n".join(kept).strip())
+    return cleaned_pages
+
+
 def chunk_pages(pages: list[str]) -> list[tuple[int, int, str]]:
+    """Create page-local chunks so a citation never spans unrelated pages."""
     chunks: list[tuple[int, int, str]] = []
-    current: list[str] = []
-    start_page = 1
-    current_words = 0
-    for page_no, page_text in enumerate(pages, 1):
-        paragraphs = [clean_text(p) for p in re.split(r"\n\s*\n", page_text) if clean_text(p)]
+    cleaned_pages = remove_repeated_page_boilerplate(pages)
+    chunk_size = max(1, CHUNK_WORDS)
+    overlap = min(max(0, CHUNK_OVERLAP), chunk_size - 1)
+    step = max(1, chunk_size - overlap)
+
+    for page_no, page_text in enumerate(cleaned_pages, 1):
+        paragraphs = [
+            clean_text(part)
+            for part in re.split(r"\n\s*\n", page_text)
+            if clean_text(part)
+        ]
         words = " ".join(paragraphs).split()
-        while words:
-            take = min(CHUNK_WORDS - current_words, len(words))
-            current.extend(words[:take])
-            words = words[take:]
-            current_words += take
-            if current_words >= CHUNK_WORDS:
-                chunks.append((start_page, page_no, " ".join(current)))
-                current = current[-CHUNK_OVERLAP:] if CHUNK_OVERLAP else []
-                current_words = len(current)
-                start_page = page_no
-    if current:
-        chunks.append((start_page, len(pages), " ".join(current)))
+        if not words:
+            continue
+        for start in range(0, len(words), step):
+            chunk_words = words[start:start + chunk_size]
+            if not chunk_words:
+                continue
+            chunks.append((page_no, page_no, " ".join(chunk_words)))
+            if start + chunk_size >= len(words):
+                break
     return chunks
 
 
@@ -121,10 +239,11 @@ def hybrid_retrieve(
     if not rows:
         return []
     texts = [row["text"] for row in rows]
-    lexical = bm25_scores(query, texts)
+    search_query = correct_query_terms(query, texts)
+    lexical = bm25_scores(search_query, texts)
     vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), min_df=1)
     matrix = vectorizer.fit_transform(texts)
-    tfidf = cosine_similarity(vectorizer.transform([query]), matrix)[0].tolist()
+    tfidf = cosine_similarity(vectorizer.transform([search_query]), matrix)[0].tolist()
 
     def normalize(values: list[float]) -> list[float]:
         maximum = max(values) if values else 0.0
@@ -136,8 +255,8 @@ def hybrid_retrieve(
 
     selected = ranked[:k]
     if diversify_documents and k > 1:
-        query_terms = set(content_tokens(query))
-        minimum_overlap = max(1, (len(query_terms) + 3) // 4) if query_terms else 1
+        query_terms = set(content_tokens(search_query))
+        minimum_overlap = minimum_query_overlap(search_query)
         selected = []
         selected_ids: set[str] = set()
         seen_documents: set[str] = set()
@@ -198,20 +317,34 @@ def rerank_score(question: str, text: str, retrieval_score: float, rank: int) ->
 
 def rerank(question: str, candidates: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
     ranked = []
+    corpus_texts = [str(item.get("text", "")) for item in candidates]
+    search_question = correct_query_terms(question, corpus_texts)
     for rank, item in enumerate(candidates):
-        x = dict(item); x["rerank_score"] = round(rerank_score(question, x["text"], x["score"], rank), 4); ranked.append(x)
+        x = dict(item)
+        x["rerank_score"] = round(rerank_score(search_question, x["text"], x["score"], rank), 4)
+        ranked.append(x)
     ranked.sort(key=lambda x: (-x["rerank_score"], -x["score"], x["chunk_id"]))
     return ranked[:k]
 
 
 def evidence_coverage(question: str, results: list[dict[str, Any]]) -> float:
-    q = set(content_tokens(question)); context = set(content_tokens(" ".join(r["text"] for r in results)))
-    return len(q & context) / len(q) if q and results else 0.0
+    if not results:
+        return 0.0
+    corpus_texts = [str(result.get("text", "")) for result in results]
+    normalized_question = correct_query_terms(question, corpus_texts)
+    q = set(content_tokens(normalized_question))
+    context = set(content_tokens(" ".join(corpus_texts)))
+    return len(q & context) / len(q) if q else 0.0
 
 
 def has_sufficient_evidence(question: str, results: list[dict[str, Any]]) -> bool:
-    q = set(content_tokens(question)); context = set(content_tokens(" ".join(r["text"] for r in results)))
-    return bool(q and results and len(q & context) >= max(1, math.ceil(len(q) * 0.34)))
+    if not results:
+        return False
+    corpus_texts = [str(result.get("text", "")) for result in results]
+    normalized_question = correct_query_terms(question, corpus_texts)
+    q = set(content_tokens(normalized_question))
+    context = set(content_tokens(" ".join(corpus_texts)))
+    return bool(q and len(q & context) >= minimum_query_overlap(normalized_question))
 
 
 def extractive_answer(question: str, results: list[dict[str, Any]]) -> str:

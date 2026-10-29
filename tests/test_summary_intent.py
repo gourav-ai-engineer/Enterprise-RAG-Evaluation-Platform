@@ -134,3 +134,102 @@ def test_broad_summary_reaches_gemini_without_keyword_overlap_abstention(monkeyp
     assert result["answerable"] is True
     assert result["mode"] == "gemini"
     assert {group["document_id"] for group in result["evidence_groups"]} == {"seminar", "resume"}
+
+
+def test_method_explanation_intent_detects_broad_requests() -> None:
+    assert gemini_main.is_method_explanation_request(
+        "Explain the main method described in these documents."
+    )
+    assert gemini_main.is_method_explanation_request("Describe the proposed approach in the PDFs.")
+    assert not gemini_main.is_method_explanation_request("What are Gourav's achievements?")
+
+
+def test_method_prompt_focuses_on_steps_and_does_not_invent_methods() -> None:
+    results = [
+        {
+            "chunk_id": "method-1",
+            "document_id": "doc-a",
+            "filename": "QFC_Seminar.pdf",
+            "page_start": 3,
+            "page_end": 3,
+            "text": "The method selects attention heads by measuring fidelity changes after pruning.",
+            "score": 1.0,
+        },
+        {
+            "chunk_id": "resume-1",
+            "document_id": "doc-b",
+            "filename": "Gourav_Resume.pdf",
+            "page_start": 1,
+            "page_end": 1,
+            "text": "The resume lists AI/ML projects and work experience.",
+            "score": 1.0,
+        },
+    ]
+
+    system, user = gemini_main.build_prompt(
+        "Explain the main method described in these documents.", results
+    )
+
+    assert "Explain the method for each supplied source separately" in system
+    assert "Do not confuse a document's subject/background with its proposed method" in system
+    assert "QFC_Seminar.pdf" in user
+    assert "Gourav_Resume.pdf" in user
+
+
+def test_method_explanation_uses_representative_evidence_and_calls_gemini(monkeypatch) -> None:
+    question = "Explain the main method described in these documents."
+    rows = [
+        make_chunk(
+            "method-1",
+            "seminar",
+            "QFC_Seminar.pdf",
+            3,
+            "The method selects attention heads by measuring fidelity changes after pruning.",
+        ),
+        make_chunk(
+            "resume-1",
+            "resume",
+            "Gourav_Resume.pdf",
+            1,
+            "The resume lists AI/ML projects and engineering experience.",
+        ),
+    ]
+    generated: list[list[dict]] = []
+
+    def fake_load_chunks(document_ids=None, document_id=None):
+        assert document_ids == ["seminar", "resume"]
+        return rows
+
+    async def fake_generation(model, q, results, on_text=None, on_reset=None):
+        generated.append(results)
+        answer = (
+            "QFC_Seminar.pdf describes a method that prunes attention heads according "
+            "to fidelity changes [Source 1]. The resume lists projects and experience "
+            "but does not describe a specific method in the supplied passage [Source 2]."
+        )
+        if on_text:
+            await on_text(answer)
+        return answer, 5.0, 14.0, 2, "test-model"
+
+    monkeypatch.setattr(core, "load_chunks", fake_load_chunks)
+    monkeypatch.setattr(gemini_main, "gemini_stream_generate_with_fallback", fake_generation)
+
+    async def call_endpoint():
+        response = await gemini_main.ask_stream(gemini_main.StreamAskRequest(
+            question=question,
+            document_ids=["seminar", "resume"],
+            top_k=3,
+        ))
+        blocks = []
+        async for part in response.body_iterator:
+            blocks.append(part.decode() if isinstance(part, bytes) else part)
+        return "".join(blocks)
+
+    stream = asyncio.run(call_endpoint())
+    result_block = next(block for block in stream.split("\\n\\n") if block.startswith("event: result"))
+    result = json.loads(result_block.split("data: ", 1)[1])
+
+    assert len(generated) == 1
+    assert result["answerable"] is True
+    assert result["mode"] == "gemini"
+    assert {item["document_id"] for item in generated[0]} == {"seminar", "resume"}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enterprise_main
 import main as core
 
 
@@ -61,3 +62,33 @@ def test_repeated_name_alone_is_not_enough_for_achievements_query() -> None:
     }]
 
     assert not core.has_sufficient_evidence("achivements of Gourav", footer_only)
+
+
+def test_bulk_reprocess_endpoint_rebuilds_all_indexed_documents(monkeypatch) -> None:
+    class FakeCursor:
+        def fetchall(self):
+            return [{"id": "doc-a"}, {"id": "doc-b"}]
+
+    class FakeConnection:
+        def execute(self, query):
+            assert "SELECT id FROM documents" in query
+            return FakeCursor()
+
+        def close(self):
+            pass
+
+    processed = []
+    monkeypatch.setattr(enterprise_main.core, "db", lambda: FakeConnection())
+
+    def fake_reprocess(document_id: str):
+        processed.append(document_id)
+        return {"document_id": document_id, "chunks": 3, "version": 2}
+
+    monkeypatch.setattr(enterprise_main, "reprocess", fake_reprocess)
+
+    result = enterprise_main.reprocess_all()
+
+    assert processed == ["doc-a", "doc-b"]
+    assert result["total"] == 2
+    assert result["reprocessed"] == 2
+    assert result["failed"] == 0

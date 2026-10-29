@@ -219,7 +219,7 @@ def reprocess(document_id: str) -> dict[str, Any]:
         raise HTTPException(404, "Stored PDF is missing")
     from pypdf import PdfReader
     try:
-        pages = [core.clean_text(p.extract_text() or "") for p in PdfReader(str(path)).pages]
+        pages = [core.clean_page_text(p.extract_text() or "") for p in PdfReader(str(path)).pages]
         chunks = core.chunk_pages(pages)
     except Exception as exc:
         raise HTTPException(400, f"Could not reprocess PDF: {exc}") from exc

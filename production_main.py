@@ -119,7 +119,7 @@ async def upload_document(file: UploadFile = File(...)) -> dict:
     if chunks is None:
         try:
             reader = PdfReader(str(stored))
-            pages = [core.clean_text(page.extract_text() or "") for page in reader.pages]
+            pages = [core.clean_page_text(page.extract_text() or "") for page in reader.pages]
             chunks = core.chunk_pages(pages)
         except Exception as exc:
             stored.unlink(missing_ok=True)

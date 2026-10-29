@@ -106,11 +106,30 @@ def evidence_groups(results: list[dict]) -> list[dict]:
 
 
 
-def candidate_matches_question(question: str, item: dict) -> bool:
-    """Check that a passage contains at least one query concept."""
+def candidate_matches_question(
+    question: str,
+    item: dict,
+    allow_semantic_for_relevant_document: bool = False,
+) -> bool:
+    """Accept wording matches or a strong dense match within a relevant document."""
+    if float(item.get("score", 0.0)) <= 0:
+        return False
+    if core.query_term_match_score(question, str(item.get("text", ""))) > 0:
+        return True
+    # For profile queries, a source must first pass document-level attribute and
+    # entity checks. Within that already-relevant source, dense similarity may
+    # select a paraphrased passage without repeating the exact topic word.
+    is_profile_query = core.profile_query_intent(question) is not None
+    if is_profile_query and not allow_semantic_for_relevant_document:
+        return False
+    query_terms = set(core.content_tokens(question))
     return (
-        float(item.get("score", 0.0)) > 0
-        and core.query_term_match_score(question, str(item.get("text", ""))) > 0
+        len(query_terms) >= 2
+        and float(item.get("dense", 0.0)) >= float(
+            os.getenv("DENSE_SOURCE_RELEVANCE_THRESHOLD", "0.38")
+        )
+        and item.get("dense_rank") is not None
+        and int(item["dense_rank"]) <= 10
     )
 
 
@@ -123,13 +142,27 @@ def diversify_reranked_results(
     """Select topic-relevant passages from documents matching the query as a whole."""
     source_rows = all_rows if all_rows is not None else ranked_results
     relevant_docs = core.relevant_document_ids(question, source_rows)
+    semantic_docs = {
+        str(item.get("document_id") or item.get("filename", ""))
+        for item in ranked_results
+        if candidate_matches_question(question, item)
+        and core.query_term_match_score(question, str(item.get("text", ""))) == 0
+    }
+    if core.profile_query_intent(question) is None:
+        relevant_docs.update(semantic_docs)
     if not relevant_docs:
         return []
 
     eligible = [
         item for item in ranked_results
         if str(item.get("document_id") or item.get("filename", "")) in relevant_docs
-        and candidate_matches_question(question, item)
+        and candidate_matches_question(
+            question,
+            item,
+            allow_semantic_for_relevant_document=(
+                str(item.get("document_id") or item.get("filename", "")) in relevant_docs
+            ),
+        )
     ]
     best_by_document: dict[str, dict] = {}
     for item in eligible:
@@ -542,7 +575,22 @@ async def gemini_stream_generate_with_fallback(
 
 @app.get("/api/runtime")
 async def runtime():
-    return {"provider": "gemini", "models": GEMINI_MODELS, "default_model": DEFAULT_GEMINI_MODEL, "streaming": True}
+    return {
+        "provider": "gemini",
+        "models": GEMINI_MODELS,
+        "default_model": DEFAULT_GEMINI_MODEL,
+        "streaming": True,
+        "retrieval": {
+            "sparse": ["BM25", "TF-IDF"],
+            "dense_model": core.dense_retrieval.model_name(),
+            "fusion": "weighted reciprocal rank fusion",
+            "weights": {
+                "bm25": float(os.getenv("HYBRID_BM25_WEIGHT", "0.35")),
+                "tfidf": float(os.getenv("HYBRID_TFIDF_WEIGHT", "0.15")),
+                "dense": float(os.getenv("HYBRID_DENSE_WEIGHT", "0.50")),
+            },
+        },
+    }
 
 
 @app.post("/api/ask/stream")
@@ -604,7 +652,7 @@ async def ask_stream(body: StreamAskRequest):
                     "label": "Hybrid retrieval",
                     "detail": (
                         f"Searching {len(rows)} indexed chunks across {len(scoped_document_ids)} "
-                        f"documents with BM25 + TF-IDF{correction_note}"
+                        f"documents with BM25 + TF-IDF + dense semantics (weighted RRF){correction_note}"
                     ),
                     "active": True,
                 })

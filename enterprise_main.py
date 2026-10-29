@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -16,7 +17,8 @@ import production_main as base
 import main as core
 
 app = base.app
-VERSION = "4.2.1"
+VERSION = "4.3.0"
+logger = logging.getLogger(__name__)
 
 
 def now() -> str:
@@ -223,18 +225,54 @@ def reprocess(document_id: str) -> dict[str, Any]:
         chunks = core.chunk_pages(pages)
     except Exception as exc:
         raise HTTPException(400, f"Could not reprocess PDF: {exc}") from exc
+    new_chunks = [
+        {
+            "id": uuid.uuid4().hex,
+            "document_id": document_id,
+            "filename": row["filename"],
+            "page_start": start,
+            "page_end": end,
+            "text": text,
+        }
+        for start, end, text in chunks
+    ]
     conn = core.db()
+    conn.execute(
+        "DELETE FROM chunk_embeddings WHERE chunk_id IN "
+        "(SELECT id FROM chunks WHERE document_id=?)",
+        (document_id,),
+    )
     conn.execute("DELETE FROM chunks WHERE document_id=?", (document_id,))
-    conn.executemany("INSERT INTO chunks(id,document_id,filename,page_start,page_end,text) VALUES(?,?,?,?,?,?)", [(uuid.uuid4().hex, document_id, row["filename"], s, e, t) for s, e, t in chunks])
+    conn.executemany(
+        "INSERT INTO chunks(id,document_id,filename,page_start,page_end,text) VALUES(?,?,?,?,?,?)",
+        [(
+            item["id"], item["document_id"], item["filename"],
+            item["page_start"], item["page_end"], item["text"],
+        ) for item in new_chunks],
+    )
     new_version = int(row["version"] or 1) + 1
-    conn.execute("UPDATE documents SET pages=?,chunks=?,version=?,status='indexed',updated_at=? WHERE id=?", (len(pages), len(chunks), new_version, now(), document_id))
+    conn.execute("UPDATE documents SET pages=?,chunks=?,version=?,status='indexed',updated_at=? WHERE id=?", (len(pages), len(new_chunks), new_version, now(), document_id))
     conn.commit()
     conn.close()
+
+    dense_indexed = True
+    try:
+        core.index_dense_embeddings(new_chunks)
+    except Exception:
+        dense_indexed = False
+        logger.exception("Dense embedding reindex failed for document %s", document_id)
+
     if row["sha256"]:
         base.save_chunk_cache(row["sha256"], row["filename"], len(pages), chunks)
     base._retrieve_cache.clear()
-    audit("document.reprocess", "document", document_id, {"pages": len(pages), "chunks": len(chunks), "version": new_version})
-    return {"document_id": document_id, "pages": len(pages), "chunks": len(chunks), "version": new_version}
+    audit("document.reprocess", "document", document_id, {
+        "pages": len(pages), "chunks": len(new_chunks),
+        "version": new_version, "dense_indexed": dense_indexed,
+    })
+    return {
+        "document_id": document_id, "pages": len(pages), "chunks": len(new_chunks),
+        "version": new_version, "dense_indexed": dense_indexed,
+    }
 
 
 @app.post("/api/documents/reprocess-all")
@@ -273,6 +311,11 @@ def delete_document(document_id: str) -> dict[str, Any]:
     if not row:
         conn.close()
         raise HTTPException(404, "Document not found")
+    conn.execute(
+        "DELETE FROM chunk_embeddings WHERE chunk_id IN "
+        "(SELECT id FROM chunks WHERE document_id=?)",
+        (document_id,),
+    )
     conn.execute("DELETE FROM chunks WHERE document_id=?", (document_id,))
     conn.execute("DELETE FROM documents WHERE id=?", (document_id,))
     conn.commit()

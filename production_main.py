@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -21,6 +22,7 @@ CACHE_DIR = DATA_DIR / "cache"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "25"))
+logger = logging.getLogger(__name__)
 
 app.routes[:] = [
     route for route in app.routes
@@ -132,15 +134,29 @@ async def upload_document(file: UploadFile = File(...)) -> dict:
         pages = [""] * max((end for _, end, _ in chunks), default=0)
 
     document_id = uuid.uuid4().hex
+    chunk_rows = [
+        {
+            "id": uuid.uuid4().hex,
+            "document_id": document_id,
+            "filename": filename,
+            "page_start": start,
+            "page_end": end,
+            "text": text,
+        }
+        for start, end, text in chunks
+    ]
     conn = core.db()
     try:
         conn.execute(
             "INSERT INTO documents(id,filename,stored_path,pages,chunks,sha256) VALUES(?,?,?,?,?,?)",
-            (document_id, filename, str(stored), len(pages), len(chunks), sha256),
+            (document_id, filename, str(stored), len(pages), len(chunk_rows), sha256),
         )
         conn.executemany(
             "INSERT INTO chunks(id,document_id,filename,page_start,page_end,text) VALUES(?,?,?,?,?,?)",
-            [(uuid.uuid4().hex, document_id, filename, start, end, text) for start, end, text in chunks],
+            [(
+                item["id"], item["document_id"], item["filename"],
+                item["page_start"], item["page_end"], item["text"],
+            ) for item in chunk_rows],
         )
         conn.commit()
     except Exception:
@@ -148,13 +164,32 @@ async def upload_document(file: UploadFile = File(...)) -> dict:
         conn.close()
         raise
     conn.close()
-    _retrieve_cache.clear()
 
-    return {
+    # Warm/index dense vectors during ingestion so the first user query does not
+    # have to embed every passage. A transient model-download failure is exposed
+    # in the upload response; retrieval will retry indexing before answering.
+    dense_indexed = True
+    dense_index_error = None
+    try:
+        core.index_dense_embeddings(chunk_rows)
+    except Exception:
+        dense_indexed = False
+        dense_index_error = (
+            "Dense indexing could not complete during upload; the first query will retry. "
+            "Check model download access and the persistent FastEmbed cache."
+        )
+        logger.exception("Dense embedding indexing failed for uploaded document %s", document_id)
+
+    _retrieve_cache.clear()
+    result = {
         "id": document_id, "document_id": document_id, "filename": filename,
-        "pages": len(pages), "chunks": len(chunks), "sha256": sha256,
-        "duplicate": False, "cache_hit": cache_hit, "message": "PDF indexed successfully.",
+        "pages": len(pages), "chunks": len(chunk_rows), "sha256": sha256,
+        "duplicate": False, "cache_hit": cache_hit, "dense_indexed": dense_indexed,
+        "message": "PDF indexed successfully.",
     }
+    if dense_index_error:
+        result["dense_index_error"] = dense_index_error
+    return result
 
 
 _retrieve_cache: dict[tuple, list[dict]] = {}
@@ -172,7 +207,14 @@ def cached_hybrid_retrieve(
     global _retrieve_cache_hits, _retrieve_cache_misses
     chunk_ids = tuple(row["id"] for row in rows)
     # The flag changes the returned candidates, so it must be part of the cache key.
-    key = (query.strip().lower(), chunk_ids, int(k), bool(diversify_documents))
+    key = (
+        query.strip().lower(), chunk_ids, int(k), bool(diversify_documents),
+        core.dense_retrieval.model_name(),
+        os.getenv("HYBRID_BM25_WEIGHT", "0.35"),
+        os.getenv("HYBRID_TFIDF_WEIGHT", "0.15"),
+        os.getenv("HYBRID_DENSE_WEIGHT", "0.50"),
+        os.getenv("HYBRID_RRF_K", "60"),
+    )
     hit = _retrieve_cache.get(key)
     if hit is not None:
         _retrieve_cache_hits += 1
@@ -204,12 +246,25 @@ async def root() -> HTMLResponse:
 @app.get("/api/cache/stats")
 def cache_stats() -> dict:
     files = list(CACHE_DIR.glob("*.json"))
+    model_name = core.dense_retrieval.model_name()
+    conn = core.db()
+    try:
+        total_chunks = int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+        dense_chunks = int(conn.execute(
+            "SELECT COUNT(DISTINCT chunk_id) FROM chunk_embeddings WHERE model_name=?",
+            (model_name,),
+        ).fetchone()[0])
+    finally:
+        conn.close()
     return {
         "retrieval_cache_entries": len(_retrieve_cache),
         "retrieval_cache_hits": _retrieve_cache_hits,
         "retrieval_cache_misses": _retrieve_cache_misses,
         "ingestion_cache_entries": len(files),
         "cache_directory": str(CACHE_DIR),
+        "dense_embedding_model": model_name,
+        "dense_indexed_chunks": dense_chunks,
+        "chunks_missing_dense_embeddings": max(0, total_chunks - dense_chunks),
     }
 
 

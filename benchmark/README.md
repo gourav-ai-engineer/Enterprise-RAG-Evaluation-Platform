@@ -1,9 +1,14 @@
 # Retrieval Benchmark
 
-The benchmark compares the committed retrieval pipeline before and after reranking:
+The benchmark now calls the **production retrieval implementation** in `main.py`, rather than maintaining a separate lexical-only copy of the algorithms.
 
-- **Hybrid** — BM25 + TF-IDF candidate ranking
-- **Hybrid + Rerank** — hybrid candidates followed by the query-aware cross-signal reranker used by `main.py`
+Compared methods:
+
+- **BM25 baseline** — sparse keyword ranking.
+- **BM25 + TF-IDF + Dense (weighted RRF)** — current hybrid retriever.
+- **Hybrid RRF + heuristic reranker** — the current hybrid retriever followed by the production query-aware reranker.
+
+Dense retrieval uses the configured FastEmbed model (default `BAAI/bge-small-en-v1.5`). Passage vectors are indexed before timing. First-time model download and vector creation are setup costs, not query-latency measurements.
 
 Metrics:
 
@@ -11,10 +16,8 @@ Metrics:
 - Recall@K
 - MRR
 - nDCG@K
-- mean latency
-- p95 latency
-- retrieval-stage latency
-- rerank-stage latency
+- Mean and p95 latency
+- Retrieval-stage and rerank-stage latency
 
 ## Run
 
@@ -24,25 +27,29 @@ From the repository root:
 python benchmark/benchmark.py
 ```
 
+The first run downloads the small ONNX embedding model unless it is already cached. Model artifacts are stored under `data/models/fastembed` by default. In Docker, persist the `/app/data` volume so model files and indexed vectors survive restarts.
+
 Outputs:
 
 - `benchmark/results/benchmark_results.json`
 - `benchmark/results/benchmark_report.md`
 
-## Chunking evaluation
+The benchmark stores temporary vectors using unique IDs and removes them when finished. It uses the same `hybrid_retrieve` and `rerank` functions as the running application.
 
-The production index uses paragraph-aware, page-preserving chunks with configurable `CHUNK_WORDS` and `CHUNK_OVERLAP`. Chunking should be treated as an experimental variable, not a permanently assumed optimum. Research shows that chunk size and structure interact with the corpus and task; recent studies report different optima for concise fact retrieval versus broader contextual questions. citeturn0academia15turn0search0
+## Chunking and retrieval evaluation
 
-For this project, the next benchmark stage should evaluate the same query set across several chunk profiles and select the configuration by measured retrieval quality plus latency, rather than claiming a universal "best" chunk size.
+Chunk size, overlap, sparse/dense weights, RRF constant, and semantic answerability thresholds are experimental variables. Evaluate them on representative labeled queries, including paraphrases, multi-document questions and unanswerable questions. Do not assume a universal optimal chunk size or weight setting.
+
+A useful evaluation should compare the current hybrid to BM25-only and measure both ranking quality and latency. Use a larger domain-specific set before reporting external resume metrics; the bundled 15-query set is suitable for smoke/regression evaluation, not a claim of broad production accuracy.
 
 ## Resume-safe reporting
 
-Do **not** copy invented metrics into a resume. Run the benchmark on the current code and report the generated measurements.
+Do not quote old benchmark numbers after the retrieval implementation changes. Run the current benchmark and report generated metrics with the query/document count and baseline named explicitly.
 
 Example:
 
-> Built an enterprise RAG evaluation platform with paragraph-aware PDF chunking, hybrid BM25 + TF-IDF retrieval, query-aware reranking, grounded LLM generation, page citations, and reproducible latency benchmarking; improved **[measured metric]** by **[measured delta]** versus **[baseline]** across **[N]** queries.
+> Built an enterprise RAG platform with page-local PDF chunking, hybrid BM25/TF-IDF/dense semantic retrieval, weighted Reciprocal Rank Fusion, query-aware reranking, grounded generation, and source/page citations; measured **[metric]** against BM25-only across **[N]** labeled queries.
 
 ## Extending the benchmark
 
-Add more documents and questions to `dataset.json`. Each question should identify one or more relevant document IDs. For a realistic production benchmark, include multi-document questions, negative/unanswerable questions, page-level evidence, and questions spanning tables as well as prose.
+Add queries to `dataset.json` and label all relevant document IDs. Include exact wording, synonyms/paraphrases, multi-hop or multi-document questions, negative/unanswerable questions, OCR-heavy files, and cases where unrelated documents repeat the same entity name.

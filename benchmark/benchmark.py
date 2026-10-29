@@ -2,93 +2,218 @@ from __future__ import annotations
 
 import json
 import math
-import re
+import os
 import statistics
 import time
+import uuid
 from pathlib import Path
 
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+import main as core
 
 DATASET = Path(__file__).with_name("dataset.json")
 RESULTS = Path(__file__).with_name("results")
 RESULTS.mkdir(exist_ok=True)
-STOP = set("a an and are as at be been but by can could did do does for from how i if in into is it its me of on or our please should that the their them there these this to was were what when where which who why with would you your".split())
-TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 
-def tokens(text: str) -> list[str]: return [x.lower() for x in TOKEN_RE.findall(text or "")]
-def content(text: str) -> list[str]: return [x for x in tokens(text) if x not in STOP and len(x) > 1]
-def norm(values):
-    m=max(values) if values else 0.0
-    return [x/m if m else 0.0 for x in values]
 
-def bm25(query, docs):
-    q=content(query); fs=[]; dfs={}; lengths=[]
-    for d in docs:
-        f={}
-        for t in content(d): f[t]=f.get(t,0)+1
-        fs.append(f); lengths.append(sum(f.values()))
-        for t in f: dfs[t]=dfs.get(t,0)+1
-    avg=sum(lengths)/max(1,len(lengths)); out=[]
-    for f,dl in zip(fs,lengths):
-        s=0.0
-        for t in q:
-            if t not in f: continue
-            idf=math.log(1+(len(docs)-dfs[t]+.5)/(dfs[t]+.5))
-            s+=idf*(f[t]*2.5)/(f[t]+1.5*(.25+.75*dl/max(avg,1)))
-        out.append(s)
-    return out
+def hit(ret: list[str], relevant: set[str], k: int) -> float:
+    return float(bool(set(ret[:k]) & relevant))
 
-def rank_hybrid(query, docs):
-    b=norm(bm25(query,docs)); v=TfidfVectorizer(stop_words="english",ngram_range=(1,2),min_df=1); m=v.fit_transform(docs); t=norm(cosine_similarity(v.transform([query]),m)[0].tolist())
-    return sorted(range(len(docs)),key=lambda i:(-(.55*b[i]+.45*t[i]),i))
 
-def rerank(query, docs, base_rank):
-    q=set(content(query)); qi=query.lower(); out=[]
-    for rank,i in enumerate(base_rank):
-        text=docs[i]; low=text.lower(); terms=set(content(text)); overlap=len(q&terms)/max(1,len(q)); phrase=sum(1 for x in q if x in low)/max(1,len(q)); score=.45*(1/(rank+1))+.35*overlap+.20*phrase
-        if re.search(r"\b(what is|what are|define|defined)\b",qi) and re.search(r"\b(is|are|defined as|refers to|denotes)\b",low): score+=.18
-        if re.search(r"\b(how|calculate|formula)\b",qi) and re.search(r"\b(calculate|computed|formula|equation|using)\b",low): score+=.12
-        out.append((score,i))
-    return [i for _,i in sorted(out,key=lambda x:(-x[0],x[1]))]
+def recall(ret: list[str], relevant: set[str], k: int) -> float:
+    return len(set(ret[:k]) & relevant) / max(1, len(relevant))
 
-def hit(ret,rel,k): return float(bool(set(ret[:k])&rel))
-def recall(ret,rel,k): return len(set(ret[:k])&rel)/max(1,len(rel))
-def mrr(ret,rel,k):
-    for r,i in enumerate(ret[:k],1):
-        if i in rel:return 1/r
+
+def mrr(ret: list[str], relevant: set[str], k: int) -> float:
+    for rank, document_id in enumerate(ret[:k], start=1):
+        if document_id in relevant:
+            return 1 / rank
     return 0.0
 
-def ndcg(ret,rel,k):
-    dcg=sum(1/math.log2(r+1) for r,i in enumerate(ret[:k],1) if i in rel); ideal=sum(1/math.log2(r+1) for r in range(1,min(k,len(rel))+1)); return dcg/ideal if ideal else 0.0
 
-def evaluate(name, ranker, docs, queries, k_values=(1,3,5)):
-    series={f"Hit@{k}":[] for k in k_values}; series.update({f"Recall@{k}":[] for k in k_values}); series.update({f"NDCG@{k}":[] for k in k_values}); series["MRR"]=[]; series["latency_ms"]=[]
-    for item in queries:
-        rel={next(i for i,d in enumerate(docs) if d["id"]==rid) for rid in item["relevant"]}; t=time.perf_counter(); ret=ranker(item["query"]); series["latency_ms"].append((time.perf_counter()-t)*1000); series["MRR"].append(mrr(ret,rel,max(k_values)))
-        for k in k_values: series[f"Hit@{k}"].append(hit(ret,rel,k)); series[f"Recall@{k}"].append(recall(ret,rel,k)); series[f"NDCG@{k}"].append(ndcg(ret,rel,k))
-    result={"retriever":name,"queries":len(queries)}
-    for key,vals in series.items(): result[key]=round(statistics.mean(vals),4)
-    result["latency_p95_ms"]=round(sorted(series["latency_ms"])[max(0,math.ceil(len(series["latency_ms"])*.95)-1)],4)
+def ndcg(ret: list[str], relevant: set[str], k: int) -> float:
+    dcg = sum(
+        1 / math.log2(rank + 1)
+        for rank, document_id in enumerate(ret[:k], start=1)
+        if document_id in relevant
+    )
+    ideal_count = min(k, len(relevant))
+    ideal = sum(1 / math.log2(rank + 1) for rank in range(1, ideal_count + 1))
+    return dcg / ideal if ideal else 0.0
+
+
+def evaluate(
+    name: str,
+    ranker,
+    queries: list[dict],
+    k_values: tuple[int, ...] = (1, 3, 5),
+) -> dict:
+    metrics = {
+        f"Hit@{k}": [] for k in k_values
+    }
+    metrics.update({f"Recall@{k}": [] for k in k_values})
+    metrics.update({f"NDCG@{k}": [] for k in k_values})
+    metrics["MRR"] = []
+    metrics["latency_ms"] = []
+
+    for query in queries:
+        started = time.perf_counter()
+        ranking = ranker(query["query"])
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        relevant = set(query["relevant"])
+        metrics["latency_ms"].append(elapsed_ms)
+        metrics["MRR"].append(mrr(ranking, relevant, max(k_values)))
+        for k in k_values:
+            metrics[f"Hit@{k}"].append(hit(ranking, relevant, k))
+            metrics[f"Recall@{k}"].append(recall(ranking, relevant, k))
+            metrics[f"NDCG@{k}"].append(ndcg(ranking, relevant, k))
+
+    result = {"retriever": name, "queries": len(queries)}
+    for metric, values in metrics.items():
+        if metric == "latency_ms":
+            result["latency_mean_ms"] = round(statistics.mean(values), 4) if values else 0.0
+            ordered = sorted(values)
+            p95_index = max(0, math.ceil(len(ordered) * 0.95) - 1)
+            result["latency_p95_ms"] = round(ordered[p95_index], 4) if ordered else 0.0
+        else:
+            result[metric] = round(statistics.mean(values), 4) if values else 0.0
     return result
 
-def main():
-    data=json.loads(DATASET.read_text(encoding="utf-8")); docs=data["documents"]; queries=data["queries"]; texts=[d["text"] for d in docs]
-    hybrid=lambda q:rank_hybrid(q,texts); reranked=lambda q:rerank(q,texts,rank_hybrid(q,texts))
-    results=[evaluate("Hybrid",hybrid,docs,queries),evaluate("Hybrid+Rerank",reranked,docs,queries)]
-    stage=[]
-    for item in queries:
-        retrieval=[]; reranking=[]
-        for _ in range(3):
-            t=time.perf_counter(); base=rank_hybrid(item["query"],texts); retrieval.append((time.perf_counter()-t)*1000)
-            t=time.perf_counter(); rerank(item["query"],texts,base); reranking.append((time.perf_counter()-t)*1000)
-        stage.append({"retrieval_ms":statistics.mean(retrieval),"rerank_ms":statistics.mean(reranking)})
-    latency={"retrieval_mean_ms":round(statistics.mean(x["retrieval_ms"] for x in stage),4),"retrieval_p95_ms":round(sorted(x["retrieval_ms"] for x in stage)[max(0,math.ceil(len(stage)*.95)-1)],4),"rerank_mean_ms":round(statistics.mean(x["rerank_ms"] for x in stage),4),"rerank_p95_ms":round(sorted(x["rerank_ms"] for x in stage)[max(0,math.ceil(len(stage)*.95)-1)],4)}
-    output={"dataset":str(DATASET),"results":results,"pipeline_latency":latency,"note":"Generated measurements; rerun after retrieval/chunking changes. This benchmark uses the committed retrieval/reranking implementation, not hardcoded claims."}
-    (RESULTS/"benchmark_results.json").write_text(json.dumps(output,indent=2),encoding="utf-8")
-    lines=["# Retrieval Benchmark Results","","Generated by `python benchmark/benchmark.py`.","","| Retriever | Hit@1 | Hit@3 | Recall@5 | MRR | NDCG@5 | Mean latency (ms) | p95 latency (ms) |","|---|---:|---:|---:|---:|---:|---:|---:|"]
-    for r in results: lines.append(f"| {r['retriever']} | {r['Hit@1']:.3f} | {r['Hit@3']:.3f} | {r['Recall@5']:.3f} | {r['MRR']:.3f} | {r['NDCG@5']:.3f} | {r['latency_ms']:.3f} | {r['latency_p95_ms']:.3f} |")
-    lines += ["","## Pipeline latency","",f"- Retrieval mean: {latency['retrieval_mean_ms']:.3f} ms",f"- Retrieval p95: {latency['retrieval_p95_ms']:.3f} ms",f"- Rerank mean: {latency['rerank_mean_ms']:.3f} ms",f"- Rerank p95: {latency['rerank_p95_ms']:.3f} ms"]
-    (RESULTS/"benchmark_report.md").write_text("\n".join(lines)+"\n",encoding="utf-8"); print("\n".join(lines))
 
-if __name__=="__main__": main()
+def main() -> None:
+    data = json.loads(DATASET.read_text(encoding="utf-8"))
+    documents = data["documents"]
+    queries = data["queries"]
+    run_id = uuid.uuid4().hex
+    rows = [
+        {
+            "id": f"benchmark-{run_id}-{document['id']}",
+            "document_id": document["id"],
+            "filename": f"{document['id']}.txt",
+            "page_start": 1,
+            "page_end": 1,
+            "text": document["text"],
+        }
+        for document in documents
+    ]
+    texts = [row["text"] for row in rows]
+    chunk_ids = [row["id"] for row in rows]
+
+    try:
+        # Warm the embedding model and pre-index benchmark passage vectors before
+        # measuring query latency. First-time model download is setup, not retrieval.
+        core.index_dense_embeddings(rows)
+
+        def bm25_only(query: str) -> list[str]:
+            scores = core.bm25_scores(query, texts)
+            ranked_indices = sorted(
+                range(len(rows)),
+                key=lambda index: (-scores[index], rows[index]["document_id"]),
+            )
+            return [rows[index]["document_id"] for index in ranked_indices]
+
+        def hybrid_rrf(query: str) -> list[str]:
+            results = core.hybrid_retrieve(query, rows, len(rows))
+            return [item["document_id"] for item in results]
+
+        def hybrid_rrf_reranked(query: str) -> list[str]:
+            candidates = core.hybrid_retrieve(query, rows, len(rows))
+            results = core.rerank(query, candidates, len(candidates))
+            return [item["document_id"] for item in results]
+
+        results = [
+            evaluate("BM25 baseline", bm25_only, queries),
+            evaluate("BM25 + TF-IDF + Dense (weighted RRF)", hybrid_rrf, queries),
+            evaluate("Hybrid RRF + heuristic reranker", hybrid_rrf_reranked, queries),
+        ]
+
+        retrieval_times: list[float] = []
+        rerank_times: list[float] = []
+        for query in queries:
+            for _ in range(3):
+                started = time.perf_counter()
+                candidates = core.hybrid_retrieve(query["query"], rows, len(rows))
+                retrieval_times.append((time.perf_counter() - started) * 1000)
+
+                started = time.perf_counter()
+                core.rerank(query["query"], candidates, len(candidates))
+                rerank_times.append((time.perf_counter() - started) * 1000)
+
+        latency = {
+            "retrieval_mean_ms": round(statistics.mean(retrieval_times), 4),
+            "retrieval_p95_ms": round(
+                sorted(retrieval_times)[max(0, math.ceil(len(retrieval_times) * 0.95) - 1)],
+                4,
+            ),
+            "rerank_mean_ms": round(statistics.mean(rerank_times), 4),
+            "rerank_p95_ms": round(
+                sorted(rerank_times)[max(0, math.ceil(len(rerank_times) * 0.95) - 1)],
+                4,
+            ),
+        }
+        output = {
+            "dataset": str(DATASET),
+            "embedding_model": core.dense_retrieval.model_name(),
+            "fusion": {
+                "method": "weighted reciprocal rank fusion",
+                "rrf_k": int(os.getenv("HYBRID_RRF_K", "60")),
+                "weights": {
+                    "bm25": float(os.getenv("HYBRID_BM25_WEIGHT", "0.35")),
+                    "tfidf": float(os.getenv("HYBRID_TFIDF_WEIGHT", "0.15")),
+                    "dense": float(os.getenv("HYBRID_DENSE_WEIGHT", "0.50")),
+                },
+            },
+            "results": results,
+            "pipeline_latency": latency,
+            "note": (
+                "Uses the production retrieval and reranking functions. Dense vectors are "
+                "pre-indexed before timing. Rerun on the current code before quoting any metrics."
+            ),
+        }
+        (RESULTS / "benchmark_results.json").write_text(
+            json.dumps(output, indent=2), encoding="utf-8"
+        )
+
+        lines = [
+            "# Retrieval Benchmark Results",
+            "",
+            "Generated by `python benchmark/benchmark.py` using the production retriever.",
+            "",
+            "| Retriever | Hit@1 | Hit@3 | Recall@5 | MRR | NDCG@5 | Mean latency (ms) | p95 latency (ms) |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+        for result in results:
+            lines.append(
+                f"| {result['retriever']} | {result['Hit@1']:.3f} | "
+                f"{result['Hit@3']:.3f} | {result['Recall@5']:.3f} | "
+                f"{result['MRR']:.3f} | {result['NDCG@5']:.3f} | "
+                f"{result['latency_mean_ms']:.3f} | {result['latency_p95_ms']:.3f} |"
+            )
+        lines += [
+            "",
+            "## Pipeline latency",
+            "",
+            f"- Retrieval mean: {latency['retrieval_mean_ms']:.3f} ms",
+            f"- Retrieval p95: {latency['retrieval_p95_ms']:.3f} ms",
+            f"- Rerank mean: {latency['rerank_mean_ms']:.3f} ms",
+            f"- Rerank p95: {latency['rerank_p95_ms']:.3f} ms",
+            "",
+            f"- Dense model: `{core.dense_retrieval.model_name()}`",
+            "- Dense model download and passage indexing are excluded from query-latency measurements.",
+        ]
+        (RESULTS / "benchmark_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print("\n".join(lines))
+    finally:
+        # Benchmark vectors are temporary: keep the document corpus clean.
+        conn = core.db()
+        try:
+            conn.executemany(
+                "DELETE FROM chunk_embeddings WHERE chunk_id=?",
+                [(chunk_id,) for chunk_id in chunk_ids],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+if __name__ == "__main__":
+    main()

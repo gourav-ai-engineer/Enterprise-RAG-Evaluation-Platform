@@ -121,6 +121,36 @@ def minimum_query_overlap(question: str) -> int:
     return max(2, math.ceil(count * 0.34))
 
 
+def query_term_match_score(question: str, text: str) -> int:
+    """Weight earlier, more topic-like query terms above later entity/name terms."""
+    terms = list(dict.fromkeys(content_tokens(question)))
+    evidence_terms = set(content_tokens(text))
+    return sum(
+        len(terms) - index
+        for index, term in enumerate(terms)
+        if term in evidence_terms
+    )
+
+
+def relevant_document_ids(question: str, rows: list[Any]) -> set[str]:
+    """Determine relevance across a document's chunks, not one chunk in isolation."""
+    terms = set(content_tokens(question))
+    if not terms:
+        return set()
+    document_terms: dict[str, set[str]] = {}
+    for row in rows:
+        document_id = str(row["document_id"])
+        document_terms.setdefault(document_id, set()).update(
+            content_tokens(str(row["text"]))
+        )
+    required = minimum_query_overlap(question)
+    return {
+        document_id
+        for document_id, evidence_terms in document_terms.items()
+        if len(terms & evidence_terms) >= required
+    }
+
+
 def clean_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text or "").strip()
     return re.sub(r"(?<=\w)-\s+(?=\w)", "", text)
@@ -255,37 +285,54 @@ def hybrid_retrieve(
 
     selected = ranked[:k]
     if diversify_documents and k > 1:
-        query_terms = set(content_tokens(search_query))
-        minimum_overlap = minimum_query_overlap(search_query)
-        selected = []
-        selected_ids: set[str] = set()
-        seen_documents: set[str] = set()
+        relevant_docs = relevant_document_ids(search_query, rows)
+        if relevant_docs:
+            grouped: dict[str, list[tuple]] = {}
+            for entry in ranked:
+                document_id = str(entry[1]["document_id"])
+                if document_id in relevant_docs and query_term_match_score(search_query, entry[1]["text"]) > 0:
+                    grouped.setdefault(document_id, []).append(entry)
 
-        # Inspect the full ranked list before truncation so a source outside the
-        # global top-k can still contribute its best relevant passage.
-        for entry in ranked:
-            score, row, _, _ = entry
-            document_id = str(row["document_id"])
-            overlap = query_terms & set(content_tokens(row["text"]))
-            if (
-                score > 0
-                and len(overlap) >= minimum_overlap
-                and document_id not in seen_documents
-            ):
-                selected.append(entry)
-                selected_ids.add(str(row["id"]))
-                seen_documents.add(document_id)
+            # Select the best topical passage per relevant document. A topic term
+            # in one page and a person name in another can establish document relevance.
+            winners = []
+            for document_id, entries in grouped.items():
+                best = max(
+                    entries,
+                    key=lambda entry: (
+                        query_term_match_score(search_query, entry[1]["text"]),
+                        entry[0],
+                    ),
+                )
+                winners.append(best)
+            winners.sort(
+                key=lambda entry: (
+                    -query_term_match_score(search_query, entry[1]["text"]),
+                    -entry[0],
+                    str(entry[1]["document_id"]),
+                )
+            )
+
+            selected = []
+            selected_ids: set[str] = set()
+            for entry in winners:
                 if len(selected) >= k:
                     break
-
-        # Fill any remaining slots with the strongest overall candidates.
-        for entry in ranked:
-            if len(selected) >= k:
-                break
-            chunk_id = str(entry[1]["id"])
-            if chunk_id not in selected_ids:
+                chunk_id = str(entry[1]["id"])
                 selected.append(entry)
                 selected_ids.add(chunk_id)
+
+            # Fill only from documents that independently matched the full query.
+            for entry in ranked:
+                if len(selected) >= k:
+                    break
+                if str(entry[1]["document_id"]) not in relevant_docs:
+                    continue
+                chunk_id = str(entry[1]["id"])
+                if chunk_id not in selected_ids:
+                    selected.append(entry)
+                    selected_ids.add(chunk_id)
+
 
     return [
         {

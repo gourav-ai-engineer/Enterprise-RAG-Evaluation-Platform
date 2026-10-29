@@ -92,3 +92,42 @@ def test_bulk_reprocess_endpoint_rebuilds_all_indexed_documents(monkeypatch) -> 
     assert result["total"] == 2
     assert result["reprocessed"] == 2
     assert result["failed"] == 0
+
+
+
+def test_misspelled_topic_selects_achievement_chunk_not_name_footer() -> None:
+    question = "achivements of Gourav"
+    rows = [
+        {
+            "id": "resume-name",
+            "document_id": "resume",
+            "filename": "Gourav_M.tech_CSE(AI).pdf",
+            "page_start": 1,
+            "page_end": 1,
+            "text": "Gourav Kumar is an M.Tech candidate at NIT Silchar.",
+        },
+        {
+            "id": "resume-achievements",
+            "document_id": "resume",
+            "filename": "Gourav_M.tech_CSE(AI).pdf",
+            "page_start": 2,
+            "page_end": 2,
+            "text": "Achievements and Certifications. GATE qualified in 2024 and 2025. Solved 200 plus LeetCode problems.",
+        },
+        {
+            "id": "seminar-footer",
+            "document_id": "seminar",
+            "filename": "QFC_Seminar.pdf",
+            "page_start": 4,
+            "page_end": 4,
+            "text": "Gourav — 2522105 — NIT Silchar",
+        },
+    ]
+    normalized = core.correct_query_terms(question, [row["text"] for row in rows])
+
+    candidates = core.hybrid_retrieve(normalized, rows, 10, diversify_documents=True)
+
+    assert "achievements" in normalized.casefold()
+    assert candidates
+    assert {item["document_id"] for item in candidates} == {"resume"}
+    assert candidates[0]["chunk_id"] == "resume-achievements"

@@ -43,7 +43,8 @@ The corpus is **not hard-coded**. Users upload PDFs through the web UI or `POST 
 - Remove short repeated PDF headers/footers, including page-number variants, before chunking.
 - Corpus-aware single-character typo correction for retrieval queries (for example, "achivements" → "achievements").
 - Hybrid BM25 + TF-IDF bigram retrieval with document-level relevance checks and topic-weighted source diversity.
-- Dedicated summary intent: broad summary requests sample representative page-local passages from every selected PDF instead of lexical-searching words like “summarize” and “PDF”.
+- Dedicated summary and method-explanation intents: broad requests (for example, “summarize both PDFs” or “explain the main method described in these documents”) sample representative page-local passages from each selected PDF instead of lexical-searching generic prompt words.
+- Task-specific prompts produce a per-document summary or explain the problem, steps, method, and stated limitations without inventing a method for a source that does not describe one.
 - Per-source summary prompts cite each document separately and use a larger output budget than short factual answers.
 - Candidate expansion followed by intent-aware reranking.
 - Definition/method/purpose signals and table/numeric noise suppression.

@@ -107,31 +107,55 @@ def evidence_groups(results: list[dict]) -> list[dict]:
 
 
 def candidate_matches_question(question: str, item: dict) -> bool:
-    """Require actual question-term overlap before counting a source as relevant."""
-    query_terms = set(core.content_tokens(question))
-    if not query_terms or float(item.get("score", 0.0)) <= 0:
-        return False
-    evidence_terms = set(core.content_tokens(item.get("text", "")))
-    minimum_overlap = max(1, (len(query_terms) + 3) // 4)
-    return len(query_terms & evidence_terms) >= minimum_overlap
+    """Check that a passage contains at least one query concept."""
+    return (
+        float(item.get("score", 0.0)) > 0
+        and core.query_term_match_score(question, str(item.get("text", ""))) > 0
+    )
 
 
 def diversify_reranked_results(
     question: str,
     ranked_results: list[dict],
     top_k: int,
+    all_rows: list | None = None,
 ) -> list[dict]:
-    """Reserve one relevant passage per document before filling global top-k slots."""
+    """Select topic-relevant passages from documents matching the query as a whole."""
+    source_rows = all_rows if all_rows is not None else ranked_results
+    relevant_docs = core.relevant_document_ids(question, source_rows)
+    if not relevant_docs:
+        return []
+
+    eligible = [
+        item for item in ranked_results
+        if str(item.get("document_id") or item.get("filename", "")) in relevant_docs
+        and candidate_matches_question(question, item)
+    ]
     best_by_document: dict[str, dict] = {}
-    for item in ranked_results:
+    for item in eligible:
         document_id = str(item.get("document_id") or item.get("filename", ""))
-        if document_id not in best_by_document and candidate_matches_question(question, item):
+        current = best_by_document.get(document_id)
+        key = (
+            core.query_term_match_score(question, str(item.get("text", ""))),
+            float(item.get("rerank_score", 0.0)),
+            float(item.get("score", 0.0)),
+        )
+        current_key = (
+            core.query_term_match_score(question, str(current.get("text", ""))),
+            float(current.get("rerank_score", 0.0)),
+            float(current.get("score", 0.0)),
+        ) if current is not None else None
+        if current is None or key > current_key:
             best_by_document[document_id] = item
 
-    document_winners = [
-        item for item in ranked_results
-        if best_by_document.get(str(item.get("document_id") or item.get("filename", ""))) is item
-    ]
+    document_winners = sorted(
+        best_by_document.values(),
+        key=lambda item: (
+            -core.query_term_match_score(question, str(item.get("text", ""))),
+            -float(item.get("rerank_score", 0.0)),
+            -float(item.get("score", 0.0)),
+        ),
+    )
     effective_k = min(10, max(top_k, len(document_winners)))
     selected: list[dict] = []
     selected_ids: set[str] = set()
@@ -140,11 +164,11 @@ def diversify_reranked_results(
         if len(selected) >= effective_k:
             break
         chunk_id = str(item.get("chunk_id", ""))
-        if chunk_id not in selected_ids:
-            selected.append(item)
-            selected_ids.add(chunk_id)
+        selected.append(item)
+        selected_ids.add(chunk_id)
 
-    for item in ranked_results:
+    # Fill only from source documents that independently match the full query.
+    for item in eligible:
         if len(selected) >= effective_k:
             break
         chunk_id = str(item.get("chunk_id", ""))
@@ -432,15 +456,26 @@ async def ask_stream(body: StreamAskRequest):
             rows = core.load_chunks(document_ids=scope) if scope else core.load_chunks()
             scoped_document_ids = sorted({str(row["document_id"]) for row in rows})
             multi_document = len(scoped_document_ids) > 1
+            search_question = core.correct_query_terms(
+                body.question, [str(row["text"]) for row in rows]
+            )
+            correction_note = (
+                f" · spelling normalized for retrieval: {search_question}"
+                if search_question.casefold() != body.question.casefold()
+                else ""
+            )
             yield sse("stage", {
                 "id": "retrieval",
                 "label": "Hybrid retrieval",
-                "detail": f"Searching {len(rows)} indexed chunks across {len(scoped_document_ids)} documents with BM25 + TF-IDF",
+                "detail": (
+                    f"Searching {len(rows)} indexed chunks across {len(scoped_document_ids)} "
+                    f"documents with BM25 + TF-IDF{correction_note}"
+                ),
                 "active": True,
             })
             t = time.perf_counter()
             candidates = core.hybrid_retrieve(
-                body.question,
+                search_question,
                 rows,
                 max(body.top_k, core.RETRIEVAL_CANDIDATES),
                 diversify_documents=multi_document,
@@ -450,12 +485,12 @@ async def ask_stream(body: StreamAskRequest):
             yield sse("stage", {"id": "rerank", "label": "Reranking evidence", "detail": "Ranking relevant passages while preserving source diversity", "active": True})
             t = time.perf_counter()
             if multi_document:
-                reranked = core.rerank(body.question, candidates, len(candidates))
-                results = diversify_reranked_results(body.question, reranked, body.top_k)
+                reranked = core.rerank(search_question, candidates, len(candidates))
+                results = diversify_reranked_results(search_question, reranked, body.top_k, all_rows=rows)
             else:
-                results = core.rerank(body.question, candidates, body.top_k)
+                results = core.rerank(search_question, candidates, body.top_k)
             rerank_ms = (time.perf_counter() - t) * 1000
-            answerable = core.has_sufficient_evidence(body.question, results)
+            answerable = core.has_sufficient_evidence(search_question, results)
             yield sse("stage", {"id": "rerank", "label": "Reranking evidence", "detail": f"Selected {len(results)} evidence chunks · {rerank_ms:.1f} ms", "done": True})
             if not answerable:
                 answer = core.ABSTAIN_MESSAGE
@@ -512,7 +547,7 @@ async def ask_stream(body: StreamAskRequest):
                 "model": model_used if mode == "gemini" else None,
                 "answerable": answerable,
                 "scope_document_ids": scoped_document_ids,
-                "evidence_coverage": round(core.evidence_coverage(body.question, results), 4),
+                "evidence_coverage": round(core.evidence_coverage(search_question, results), 4),
                 "citations": compact_citations(results) if answerable else [],
                 "evidence_groups": evidence_groups(results) if answerable else [],
                 "retrieved": results,

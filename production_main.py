@@ -64,6 +64,8 @@ def cached_chunks(sha256: str) -> list[tuple[int, int, str]] | None:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if payload.get("sha256") != sha256:
             return None
+        if payload.get("chunker_version") != core.CHUNKER_VERSION:
+            return None
         chunks = payload.get("chunks")
         if not isinstance(chunks, list):
             return None
@@ -75,6 +77,7 @@ def cached_chunks(sha256: str) -> list[tuple[int, int, str]] | None:
 def save_chunk_cache(sha256: str, filename: str, pages: int, chunks: list[tuple[int, int, str]]) -> None:
     payload = {
         "sha256": sha256,
+        "chunker_version": core.CHUNKER_VERSION,
         "filename": filename,
         "pages": pages,
         "chunks": [[start, end, text] for start, end, text in chunks],
@@ -119,7 +122,7 @@ async def upload_document(file: UploadFile = File(...)) -> dict:
     if chunks is None:
         try:
             reader = PdfReader(str(stored))
-            pages = [core.clean_text(page.extract_text() or "") for page in reader.pages]
+            pages = [core.clean_page_text(page.extract_text() or "") for page in reader.pages]
             chunks = core.chunk_pages(pages)
         except Exception as exc:
             stored.unlink(missing_ok=True)

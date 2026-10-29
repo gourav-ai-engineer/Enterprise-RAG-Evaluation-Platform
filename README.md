@@ -15,7 +15,7 @@ Content-addressed PDF + ingestion cache
    ↓
 Page-aware extraction + overlapping chunks
    ↓
-BM25 + TF-IDF hybrid retrieval
+BM25 + TF-IDF + dense BGE embeddings, fused with weighted Reciprocal Rank Fusion (RRF)
    ↓
 Reranking + evidence/answerability gate
    ↓
@@ -43,11 +43,14 @@ The corpus is **not hard-coded**. Users upload PDFs through the web UI or `POST 
 - Remove short repeated PDF headers/footers, including page-number variants, before chunking.
 - Corpus-aware single-character typo correction for retrieval queries (for example, "achivements" → "achievements").
 - Profile-attribute query expansion for qualifications, achievements, skills, experience, and projects, using only vocabulary actually present in the indexed corpus and keeping person-name matches separate from topic relevance.
-- Hybrid BM25 + TF-IDF bigram retrieval with document-level relevance checks and topic-weighted source diversity.
+- Sparse wording retrieval with BM25 and TF-IDF bigrams plus dense semantic retrieval using FastEmbed (`BAAI/bge-small-en-v1.5`, 384-dimensional vectors).
+- Weighted Reciprocal Rank Fusion (RRF) combines BM25, TF-IDF, and dense rankings without mixing incomparable raw scores; defaults are 0.35 / 0.15 / 0.50.
+- Dense passage vectors are stored by chunk ID and model name in SQLite; missing vectors are indexed on demand. A persistent FastEmbed model cache avoids repeat downloads.
+- Document-level relevance checks and source-diverse selection account for both lexical matches and high-confidence semantic candidates.
 - Dedicated summary and method-explanation intents: broad requests (for example, “summarize both PDFs” or “explain the main method described in these documents”) sample representative page-local passages from each selected PDF instead of lexical-searching generic prompt words.
 - Task-specific prompts produce a per-document summary or explain the problem, steps, method, and stated limitations without inventing a method for a source that does not describe one.
 - Per-source summary prompts cite each document separately and use a larger output budget than short factual answers.
-- Candidate expansion followed by intent-aware reranking.
+- Candidate expansion followed by a query-aware heuristic reranker that includes dense similarity as a signal.
 - Definition/method/purpose signals and table/numeric noise suppression.
 - Stricter evidence/answerability gate so a shared person name alone cannot support an unrelated topic.
 - Gemini streaming generation with strict evidence-only prompting and source IDs. All evidence-supported questions use the language-model generation path; there is no local extractive-answer substitute.
@@ -151,7 +154,7 @@ The production image starts `enterprise_main:app` and includes the enterprise li
 
 The current release establishes a tested production foundation first: content integrity, caching, document lifecycle, collections, feedback, auditability and telemetry. The next implementation layers should be delivered incrementally with integration tests:
 
-1. semantic embeddings + Qdrant/pgvector adapter
+1. Qdrant/pgvector adapter for scalable approximate-nearest-neighbor search (the current release computes dense cosine similarity over cached SQLite vectors)
 2. OpenSearch BM25 adapter for large corpora
 3. asynchronous Redis/Celery ingestion
 4. Docling/Tesseract OCR pipeline

@@ -111,20 +111,77 @@ def bm25_scores(query: str, docs: list[str]) -> list[float]:
     return scores
 
 
-def hybrid_retrieve(query: str, rows: list[sqlite3.Row], k: int) -> list[dict[str, Any]]:
-    if not rows: return []
+def hybrid_retrieve(
+    query: str,
+    rows: list[sqlite3.Row],
+    k: int,
+    diversify_documents: bool = False,
+) -> list[dict[str, Any]]:
+    """Rank chunks with BM25 + TF-IDF, optionally reserving candidates per relevant source."""
+    if not rows:
+        return []
     texts = [row["text"] for row in rows]
     lexical = bm25_scores(query, texts)
     vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), min_df=1)
     matrix = vectorizer.fit_transform(texts)
     tfidf = cosine_similarity(vectorizer.transform([query]), matrix)[0].tolist()
+
     def normalize(values: list[float]) -> list[float]:
         maximum = max(values) if values else 0.0
         return [value / maximum if maximum else 0.0 for value in values]
+
     lexical_norm, tfidf_norm = normalize(lexical), normalize(tfidf)
     ranked = [(0.55 * b + 0.45 * t, row, b, t) for row, b, t in zip(rows, lexical_norm, tfidf_norm)]
     ranked.sort(key=lambda item: (-item[0], item[1]["id"]))
-    return [{"chunk_id": row["id"], "document_id": row["document_id"], "filename": row["filename"], "page_start": row["page_start"], "page_end": row["page_end"], "score": round(score, 4), "bm25": round(bm25, 4), "tfidf": round(tf, 4), "text": row["text"]} for score, row, bm25, tf in ranked[:k]]
+
+    selected = ranked[:k]
+    if diversify_documents and k > 1:
+        query_terms = set(content_tokens(query))
+        minimum_overlap = max(1, (len(query_terms) + 3) // 4) if query_terms else 1
+        selected = []
+        selected_ids: set[str] = set()
+        seen_documents: set[str] = set()
+
+        # Inspect the full ranked list before truncation so a source outside the
+        # global top-k can still contribute its best relevant passage.
+        for entry in ranked:
+            score, row, _, _ = entry
+            document_id = str(row["document_id"])
+            overlap = query_terms & set(content_tokens(row["text"]))
+            if (
+                score > 0
+                and len(overlap) >= minimum_overlap
+                and document_id not in seen_documents
+            ):
+                selected.append(entry)
+                selected_ids.add(str(row["id"]))
+                seen_documents.add(document_id)
+                if len(selected) >= k:
+                    break
+
+        # Fill any remaining slots with the strongest overall candidates.
+        for entry in ranked:
+            if len(selected) >= k:
+                break
+            chunk_id = str(entry[1]["id"])
+            if chunk_id not in selected_ids:
+                selected.append(entry)
+                selected_ids.add(chunk_id)
+
+    return [
+        {
+            "chunk_id": row["id"],
+            "document_id": row["document_id"],
+            "filename": row["filename"],
+            "page_start": row["page_start"],
+            "page_end": row["page_end"],
+            "score": round(score, 4),
+            "bm25": round(bm25, 4),
+            "tfidf": round(tf, 4),
+            "text": row["text"],
+        }
+        for score, row, bm25, tf in selected
+    ]
 
 
 def rerank_score(question: str, text: str, retrieval_score: float, rank: int) -> float:

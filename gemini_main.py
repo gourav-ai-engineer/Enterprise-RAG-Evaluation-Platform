@@ -78,14 +78,18 @@ def _page_label(pages: list[int]) -> str:
 def evidence_groups(results: list[dict]) -> list[dict]:
     grouped: dict[str, list[dict]] = defaultdict(list)
     for result in results:
-        grouped[result["filename"]].append(result)
+        # Group by document identity, not filename: two distinct PDFs may share a filename.
+        key = str(result.get("document_id") or result["filename"])
+        grouped[key].append(result)
     groups = []
-    for filename, items in grouped.items():
+    for document_id, items in grouped.items():
+        filename = items[0]["filename"]
         pages = []
         for item in items:
             pages.extend(range(int(item["page_start"]), int(item["page_end"]) + 1))
         groups.append({
             "source_id": len(groups) + 1,
+            "document_id": document_id,
             "filename": filename,
             "pages": _page_label(pages),
             "chunks": len(items),
@@ -99,6 +103,56 @@ def evidence_groups(results: list[dict]) -> list[dict]:
             ],
         })
     return groups
+
+
+
+def candidate_matches_question(question: str, item: dict) -> bool:
+    """Require actual question-term overlap before counting a source as relevant."""
+    query_terms = set(core.content_tokens(question))
+    if not query_terms or float(item.get("score", 0.0)) <= 0:
+        return False
+    evidence_terms = set(core.content_tokens(item.get("text", "")))
+    minimum_overlap = max(1, (len(query_terms) + 3) // 4)
+    return len(query_terms & evidence_terms) >= minimum_overlap
+
+
+def diversify_reranked_results(
+    question: str,
+    ranked_results: list[dict],
+    top_k: int,
+) -> list[dict]:
+    """Reserve one relevant passage per document before filling global top-k slots."""
+    best_by_document: dict[str, dict] = {}
+    for item in ranked_results:
+        document_id = str(item.get("document_id") or item.get("filename", ""))
+        if document_id not in best_by_document and candidate_matches_question(question, item):
+            best_by_document[document_id] = item
+
+    document_winners = [
+        item for item in ranked_results
+        if best_by_document.get(str(item.get("document_id") or item.get("filename", ""))) is item
+    ]
+    effective_k = min(10, max(top_k, len(document_winners)))
+    selected: list[dict] = []
+    selected_ids: set[str] = set()
+
+    for item in document_winners:
+        if len(selected) >= effective_k:
+            break
+        chunk_id = str(item.get("chunk_id", ""))
+        if chunk_id not in selected_ids:
+            selected.append(item)
+            selected_ids.add(chunk_id)
+
+    for item in ranked_results:
+        if len(selected) >= effective_k:
+            break
+        chunk_id = str(item.get("chunk_id", ""))
+        if chunk_id not in selected_ids:
+            selected.append(item)
+            selected_ids.add(chunk_id)
+
+    return selected
 
 
 def build_prompt(question: str, results: list[dict]) -> tuple[str, str]:
@@ -376,14 +430,30 @@ async def ask_stream(body: StreamAskRequest):
         yield sse("stage", {"id": "scope", "label": "Preparing scope", "detail": "Loading selected documents"})
         try:
             rows = core.load_chunks(document_ids=scope) if scope else core.load_chunks()
-            yield sse("stage", {"id": "retrieval", "label": "Hybrid retrieval", "detail": f"Searching {len(rows)} indexed chunks with BM25 + TF-IDF", "active": True})
+            scoped_document_ids = sorted({str(row["document_id"]) for row in rows})
+            multi_document = len(scoped_document_ids) > 1
+            yield sse("stage", {
+                "id": "retrieval",
+                "label": "Hybrid retrieval",
+                "detail": f"Searching {len(rows)} indexed chunks across {len(scoped_document_ids)} documents with BM25 + TF-IDF",
+                "active": True,
+            })
             t = time.perf_counter()
-            candidates = core.hybrid_retrieve(body.question, rows, max(body.top_k, core.RETRIEVAL_CANDIDATES))
+            candidates = core.hybrid_retrieve(
+                body.question,
+                rows,
+                max(body.top_k, core.RETRIEVAL_CANDIDATES),
+                diversify_documents=multi_document,
+            )
             retrieval_ms = (time.perf_counter() - t) * 1000
-            yield sse("stage", {"id": "retrieval", "label": "Hybrid retrieval", "detail": f"Found {len(candidates)} candidates · {retrieval_ms:.0f} ms", "done": True})
-            yield sse("stage", {"id": "rerank", "label": "Reranking evidence", "detail": "Scoring top candidates", "active": True})
+            yield sse("stage", {"id": "retrieval", "label": "Hybrid retrieval", "detail": f"Found {len(candidates)} candidates across {len({item['document_id'] for item in candidates})} sources · {retrieval_ms:.0f} ms", "done": True})
+            yield sse("stage", {"id": "rerank", "label": "Reranking evidence", "detail": "Ranking relevant passages while preserving source diversity", "active": True})
             t = time.perf_counter()
-            results = core.rerank(body.question, candidates, body.top_k)
+            if multi_document:
+                reranked = core.rerank(body.question, candidates, len(candidates))
+                results = diversify_reranked_results(body.question, reranked, body.top_k)
+            else:
+                results = core.rerank(body.question, candidates, body.top_k)
             rerank_ms = (time.perf_counter() - t) * 1000
             answerable = core.has_sufficient_evidence(body.question, results)
             yield sse("stage", {"id": "rerank", "label": "Reranking evidence", "detail": f"Selected {len(results)} evidence chunks · {rerank_ms:.1f} ms", "done": True})
@@ -441,7 +511,7 @@ async def ask_stream(body: StreamAskRequest):
                 "provider": "gemini" if mode in {"gemini", "gemini_error"} else "local",
                 "model": model_used if mode == "gemini" else None,
                 "answerable": answerable,
-                "scope_document_ids": scope or [],
+                "scope_document_ids": scoped_document_ids,
                 "evidence_coverage": round(core.evidence_coverage(body.question, results), 4),
                 "citations": compact_citations(results) if answerable else [],
                 "evidence_groups": evidence_groups(results) if answerable else [],

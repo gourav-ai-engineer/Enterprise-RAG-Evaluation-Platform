@@ -563,7 +563,22 @@ async def gemini_stream_generate_with_fallback(
 
 @app.get("/api/runtime")
 async def runtime():
-    return {"provider": "gemini", "models": GEMINI_MODELS, "default_model": DEFAULT_GEMINI_MODEL, "streaming": True}
+    return {
+        "provider": "gemini",
+        "models": GEMINI_MODELS,
+        "default_model": DEFAULT_GEMINI_MODEL,
+        "streaming": True,
+        "retrieval": {
+            "sparse": ["BM25", "TF-IDF"],
+            "dense_model": core.dense_retrieval.model_name(),
+            "fusion": "weighted reciprocal rank fusion",
+            "weights": {
+                "bm25": float(os.getenv("HYBRID_BM25_WEIGHT", "0.35")),
+                "tfidf": float(os.getenv("HYBRID_TFIDF_WEIGHT", "0.15")),
+                "dense": float(os.getenv("HYBRID_DENSE_WEIGHT", "0.50")),
+            },
+        },
+    }
 
 
 @app.post("/api/ask/stream")
@@ -625,7 +640,7 @@ async def ask_stream(body: StreamAskRequest):
                     "label": "Hybrid retrieval",
                     "detail": (
                         f"Searching {len(rows)} indexed chunks across {len(scoped_document_ids)} "
-                        f"documents with BM25 + TF-IDF{correction_note}"
+                        f"documents with BM25 + TF-IDF + dense semantics (weighted RRF){correction_note}"
                     ),
                     "active": True,
                 })

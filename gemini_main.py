@@ -99,7 +99,7 @@ def evidence_groups(results: list[dict]) -> list[dict]:
                     "pages": f"{item['page_start']}-{item['page_end']}",
                     "text": item["text"],
                 }
-                for item in items[:3]
+                for item in items[:32]
             ],
         })
     return groups
@@ -179,6 +179,69 @@ def diversify_reranked_results(
     return selected
 
 
+SUMMARY_INTENT_RE = re.compile(
+    r"\b(?:summarize|summarise|summarizing|summarising|summary|overview|key points|main ideas)\b",
+    re.IGNORECASE,
+)
+
+
+def is_summary_request(question: str) -> bool:
+    """Detect broad summaries that have no meaningful lexical query terms."""
+    return bool(SUMMARY_INTENT_RE.search(question))
+
+
+def select_summary_evidence(
+    rows: list,
+    max_total_chunks: int = 32,
+    max_chunks_per_document: int = 20,
+) -> list[dict]:
+    """Sample chunks across each selected PDF instead of ranking generic words like 'PDF'."""
+    grouped: dict[str, list] = {}
+    for row in rows:
+        document_id = str(row["document_id"])
+        grouped.setdefault(document_id, []).append(row)
+    if not grouped:
+        return []
+
+    slots_per_document = min(
+        max_chunks_per_document,
+        max(1, max_total_chunks // len(grouped)),
+    )
+    selected: list[dict] = []
+    for document_rows in grouped.values():
+        ordered = sorted(
+            document_rows,
+            key=lambda row: (int(row["page_start"]), int(row["page_end"]), str(row["id"])),
+        )
+        count = min(slots_per_document, len(ordered))
+        if count == 0:
+            continue
+        if count == len(ordered):
+            indices = list(range(count))
+        elif count == 1:
+            indices = [0]
+        else:
+            indices = sorted({
+                round(index * (len(ordered) - 1) / (count - 1))
+                for index in range(count)
+            })
+        for index in indices:
+            row = ordered[index]
+            selected.append({
+                "chunk_id": row["id"],
+                "document_id": row["document_id"],
+                "filename": row["filename"],
+                "page_start": row["page_start"],
+                "page_end": row["page_end"],
+                "score": 1.0,
+                "bm25": 0.0,
+                "tfidf": 0.0,
+                "rerank_score": 1.0,
+                "text": row["text"],
+            })
+    return selected[:max_total_chunks]
+
+
 def build_prompt(question: str, results: list[dict]) -> tuple[str, str]:
     groups = evidence_groups(results)
     context = "\n\n".join(
@@ -186,18 +249,32 @@ def build_prompt(question: str, results: list[dict]) -> tuple[str, str]:
         "\n".join(item["text"] for item in group["evidence"])
         for group in groups
     )
-    system = (
-        "You are the final answer layer of a grounded enterprise RAG system. "
-        "Answer ONLY from the supplied evidence. Never use outside knowledge. "
-        "Return only the final answer, never reasoning, analysis, planning, or process commentary. "
-        "Answer the exact question directly in 1-3 COMPLETE sentences, normally under 90 words. "
-        "Finish the final sentence; never stop at an unfinished clause. "
-        "Cite factual claims with [Source N], using only source numbers present below. "
-        "For mathematical notation, use readable Unicode/plain text: α, β, γ, ρᵢ, ρ̄. "
-        "NEVER output LaTeX delimiters ($, $$, \\(, \\), \\[ or \\]) or raw commands such as \\alpha. "
-        "If an equation is needed, write it plainly, e.g. QIS = αI(ρᵢ) + βQJSD(ρᵢ) − γF(ρᵢ, ρ̄). "
-        "If the supplied evidence is insufficient, say so clearly instead of guessing."
-    )
+    if is_summary_request(question):
+        system = (
+            "You are the final answer layer of a grounded enterprise RAG system. "
+            "The user requested a document summary. Summarize each supplied source separately, "
+            "using its filename as a heading and 2-4 concise bullet points with key ideas, "
+            "goals, methods, findings, and important details when present in the evidence. "
+            "Cite every bullet with [Source N], using only source numbers supplied below. "
+            "Use only the provided passages. Do not invent details or imply unseen sections "
+            "were inspected; describe the answer as a concise overview of the available passages. "
+            "Return only the summary, never reasoning or process commentary. "
+            "Aim for a clear, useful summary under 250 words total. "
+            "For mathematical notation, use readable Unicode/plain text and never raw LaTeX."
+        )
+    else:
+        system = (
+            "You are the final answer layer of a grounded enterprise RAG system. "
+            "Answer ONLY from the supplied evidence. Never use outside knowledge. "
+            "Return only the final answer, never reasoning, analysis, planning, or process commentary. "
+            "Answer the exact question directly in 1-3 COMPLETE sentences, normally under 90 words. "
+            "Finish the final sentence; never stop at an unfinished clause. "
+            "Cite factual claims with [Source N], using only source numbers present below. "
+            "For mathematical notation, use readable Unicode/plain text: α, β, γ, ρᵢ, ρ̄. "
+            "NEVER output LaTeX delimiters ($, $$, \\\\(, \\\\), \\\\[ or \\\\]) or raw commands such as \\\\alpha. "
+            "If an equation is needed, write it plainly, e.g. QIS = αI(ρᵢ) + βQJSD(ρᵢ) − γF(ρᵢ, ρ̄). "
+            "If the supplied evidence is insufficient, say so clearly instead of guessing."
+        )
     return system, f"Question: {question}\n\nRetrieved evidence:\n{context}"
 
 
@@ -254,7 +331,7 @@ async def gemini_stream_generate(
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": [{"role": "user", "parts": [{"text": user}]}],
         "generationConfig": {
-            "maxOutputTokens": 160,
+            "maxOutputTokens": 480 if is_summary_request(question) else 160,
             # Simple factual RAG questions do not need deep reasoning.
             "thinkingConfig": {
                 "thinkingLevel": "minimal" if model in {
@@ -464,34 +541,78 @@ async def ask_stream(body: StreamAskRequest):
                 if search_question.casefold() != body.question.casefold()
                 else ""
             )
-            yield sse("stage", {
-                "id": "retrieval",
-                "label": "Hybrid retrieval",
-                "detail": (
-                    f"Searching {len(rows)} indexed chunks across {len(scoped_document_ids)} "
-                    f"documents with BM25 + TF-IDF{correction_note}"
-                ),
-                "active": True,
-            })
+            summary_request = is_summary_request(body.question)
             t = time.perf_counter()
-            candidates = core.hybrid_retrieve(
-                search_question,
-                rows,
-                max(body.top_k, core.RETRIEVAL_CANDIDATES),
-                diversify_documents=multi_document,
-            )
-            retrieval_ms = (time.perf_counter() - t) * 1000
-            yield sse("stage", {"id": "retrieval", "label": "Hybrid retrieval", "detail": f"Found {len(candidates)} candidates across {len({item['document_id'] for item in candidates})} sources · {retrieval_ms:.0f} ms", "done": True})
-            yield sse("stage", {"id": "rerank", "label": "Reranking evidence", "detail": "Ranking relevant passages while preserving source diversity", "active": True})
-            t = time.perf_counter()
-            if multi_document:
-                reranked = core.rerank(search_question, candidates, len(candidates))
-                results = diversify_reranked_results(search_question, reranked, body.top_k, all_rows=rows)
+            if summary_request:
+                results = select_summary_evidence(rows)
+                candidates = list(results)
+                retrieval_ms = (time.perf_counter() - t) * 1000
+                answerable = bool(results)
+                yield sse("stage", {
+                    "id": "retrieval",
+                    "label": "Document summary retrieval",
+                    "detail": (
+                        f"Selected {len(results)} representative passages across "
+                        f"{len({item['document_id'] for item in results})} selected documents"
+                    ),
+                    "done": True,
+                })
+                rerank_ms = 0.0
+                yield sse("stage", {
+                    "id": "rerank",
+                    "label": "Preparing summary context",
+                    "detail": "Balanced page coverage across selected documents",
+                    "done": True,
+                })
             else:
-                results = core.rerank(search_question, candidates, body.top_k)
-            rerank_ms = (time.perf_counter() - t) * 1000
-            answerable = core.has_sufficient_evidence(search_question, results)
-            yield sse("stage", {"id": "rerank", "label": "Reranking evidence", "detail": f"Selected {len(results)} evidence chunks · {rerank_ms:.1f} ms", "done": True})
+                yield sse("stage", {
+                    "id": "retrieval",
+                    "label": "Hybrid retrieval",
+                    "detail": (
+                        f"Searching {len(rows)} indexed chunks across {len(scoped_document_ids)} "
+                        f"documents with BM25 + TF-IDF{correction_note}"
+                    ),
+                    "active": True,
+                })
+                candidates = core.hybrid_retrieve(
+                    search_question,
+                    rows,
+                    max(body.top_k, core.RETRIEVAL_CANDIDATES),
+                    diversify_documents=multi_document,
+                )
+                retrieval_ms = (time.perf_counter() - t) * 1000
+                yield sse("stage", {
+                    "id": "retrieval",
+                    "label": "Hybrid retrieval",
+                    "detail": (
+                        f"Found {len(candidates)} candidates across "
+                        f"{len({item['document_id'] for item in candidates})} sources · "
+                        f"{retrieval_ms:.0f} ms"
+                    ),
+                    "done": True,
+                })
+                yield sse("stage", {
+                    "id": "rerank",
+                    "label": "Reranking evidence",
+                    "detail": "Ranking relevant passages while preserving source diversity",
+                    "active": True,
+                })
+                t = time.perf_counter()
+                if multi_document:
+                    reranked = core.rerank(search_question, candidates, len(candidates))
+                    results = diversify_reranked_results(
+                        search_question, reranked, body.top_k, all_rows=rows
+                    )
+                else:
+                    results = core.rerank(search_question, candidates, body.top_k)
+                rerank_ms = (time.perf_counter() - t) * 1000
+                answerable = core.has_sufficient_evidence(search_question, results)
+                yield sse("stage", {
+                    "id": "rerank",
+                    "label": "Reranking evidence",
+                    "detail": f"Selected {len(results)} evidence chunks · {rerank_ms:.1f} ms",
+                    "done": True,
+                })
             if not answerable:
                 answer = core.ABSTAIN_MESSAGE
                 mode = "abstain"

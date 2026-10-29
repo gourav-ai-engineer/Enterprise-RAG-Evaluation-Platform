@@ -107,7 +107,7 @@ def correct_query_terms(query: str, corpus_texts: list[str]) -> str:
                 candidate,
             ),
         )[0]
-        corrected = re.sub(rf"\\b{re.escape(term)}\\b", best, corrected, flags=re.IGNORECASE)
+        corrected = re.sub(rf"\b{re.escape(term)}\b", best, corrected, flags=re.IGNORECASE)
     return corrected
 
 

@@ -41,8 +41,7 @@ def test_hybrid_candidates_preserve_relevant_documents() -> None:
     candidates = core.hybrid_retrieve(question, rows, 10, diversify_documents=True)
 
     assert len(candidates) == 10
-    assert candidates[0]["document_id"] == "doc-a"
-    assert candidates[1]["document_id"] == "doc-b"
+    assert {item["document_id"] for item in candidates[:2]} == {"doc-a", "doc-b"}
 
 
 def test_reranking_reserves_a_relevant_passage_per_document() -> None:

@@ -106,15 +106,21 @@ def evidence_groups(results: list[dict]) -> list[dict]:
 
 
 
-def candidate_matches_question(question: str, item: dict) -> bool:
-    """Accept lexical matches or strong semantic matches for multi-concept questions."""
+def candidate_matches_question(
+    question: str,
+    item: dict,
+    allow_semantic_for_relevant_document: bool = False,
+) -> bool:
+    """Accept wording matches or a strong dense match within a relevant document."""
     if float(item.get("score", 0.0)) <= 0:
         return False
     if core.query_term_match_score(question, str(item.get("text", ""))) > 0:
         return True
-    # For profile queries, require the topic expansion to supply a matching
-    # attribute signal; do not let a shared person name alone pass.
-    if core.profile_query_intent(question) is not None:
+    # For profile queries, a source must first pass document-level attribute and
+    # entity checks. Within that already-relevant source, dense similarity may
+    # select a paraphrased passage without repeating the exact topic word.
+    is_profile_query = core.profile_query_intent(question) is not None
+    if is_profile_query and not allow_semantic_for_relevant_document:
         return False
     query_terms = set(core.content_tokens(question))
     return (
@@ -150,7 +156,13 @@ def diversify_reranked_results(
     eligible = [
         item for item in ranked_results
         if str(item.get("document_id") or item.get("filename", "")) in relevant_docs
-        and candidate_matches_question(question, item)
+        and candidate_matches_question(
+            question,
+            item,
+            allow_semantic_for_relevant_document=(
+                str(item.get("document_id") or item.get("filename", "")) in relevant_docs
+            ),
+        )
     ]
     best_by_document: dict[str, dict] = {}
     for item in eligible:

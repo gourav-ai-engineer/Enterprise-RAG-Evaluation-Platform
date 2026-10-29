@@ -160,10 +160,16 @@ _retrieve_cache_misses = 0
 _ORIGINAL_HYBRID_RETRIEVE = core.hybrid_retrieve
 
 
-def cached_hybrid_retrieve(query: str, rows, k: int):
+def cached_hybrid_retrieve(
+    query: str,
+    rows,
+    k: int,
+    diversify_documents: bool = False,
+):
     global _retrieve_cache_hits, _retrieve_cache_misses
     chunk_ids = tuple(row["id"] for row in rows)
-    key = (query.strip().lower(), chunk_ids, int(k))
+    # Diversified and globally ranked result sets are not interchangeable.
+    key = (query.strip().lower(), chunk_ids, int(k), bool(diversify_documents))
     hit = _retrieve_cache.get(key)
     if hit is not None:
         _retrieve_cache_hits += 1
@@ -171,7 +177,9 @@ def cached_hybrid_retrieve(query: str, rows, k: int):
         return [dict(item) for item in hit]
     _retrieve_cache_misses += 1
     core._last_retrieval_cache_hit = False
-    result = _ORIGINAL_HYBRID_RETRIEVE(query, rows, k)
+    result = _ORIGINAL_HYBRID_RETRIEVE(
+        query, rows, k, diversify_documents=diversify_documents
+    )
     _retrieve_cache[key] = [dict(item) for item in result]
     return result
 

@@ -6,6 +6,8 @@ import re
 import sqlite3
 import time
 import uuid
+
+import numpy as np
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -17,6 +19,8 @@ from pydantic import BaseModel, Field
 from pypdf import PdfReader
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+
+import dense_retrieval
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", APP_DIR / "data"))
@@ -41,6 +45,15 @@ def db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("CREATE TABLE IF NOT EXISTS documents(id TEXT PRIMARY KEY, filename TEXT NOT NULL, stored_path TEXT NOT NULL, pages INTEGER NOT NULL, chunks INTEGER NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
     conn.execute("CREATE TABLE IF NOT EXISTS chunks(id TEXT PRIMARY KEY, document_id TEXT NOT NULL, filename TEXT NOT NULL, page_start INTEGER NOT NULL, page_end INTEGER NOT NULL, text TEXT NOT NULL)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS chunk_embeddings(
+        chunk_id TEXT NOT NULL,
+        model_name TEXT NOT NULL,
+        dimension INTEGER NOT NULL,
+        vector BLOB NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY(chunk_id, model_name)
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_model ON chunk_embeddings(model_name)")
     conn.commit()
     return conn
 
@@ -354,94 +367,287 @@ def bm25_scores(query: str, docs: list[str]) -> list[float]:
     return scores
 
 
+def index_dense_embeddings(chunk_records: list[dict[str, Any]]) -> int:
+    """Embed and persist chunk vectors for the configured dense model."""
+    if not chunk_records:
+        return 0
+    unique_records: dict[str, dict[str, Any]] = {}
+    for item in chunk_records:
+        chunk_id = str(item["id"])
+        if chunk_id not in unique_records:
+            text = str(item.get("text", "")).strip()
+            if text:
+                unique_records[chunk_id] = {"id": chunk_id, "text": text}
+    records = list(unique_records.values())
+    if not records:
+        return 0
+
+    model_name = dense_retrieval.model_name()
+    vectors = dense_retrieval.embed_passages(
+        [item["text"] for item in records],
+        name=model_name,
+    )
+    if len(vectors) != len(records):
+        raise RuntimeError("Dense embedding count does not match the indexed chunk count")
+
+    payload = []
+    for item, vector in zip(records, vectors):
+        vector = np.asarray(vector, dtype=np.float32).reshape(-1)
+        if vector.size == 0:
+            raise RuntimeError(f"Dense embedder returned an empty vector for chunk {item['id']}")
+        payload.append((
+            item["id"],
+            model_name,
+            int(vector.size),
+            sqlite3.Binary(vector.tobytes()),
+        ))
+
+    conn = db()
+    try:
+        conn.executemany(
+            """INSERT INTO chunk_embeddings(chunk_id, model_name, dimension, vector)
+               VALUES(?,?,?,?)
+               ON CONFLICT(chunk_id, model_name) DO UPDATE SET
+                 dimension=excluded.dimension,
+                 vector=excluded.vector,
+                 created_at=CURRENT_TIMESTAMP""",
+            payload,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return len(payload)
+
+
+def _stored_dense_vectors(rows: list[Any], model_name: str) -> dict[str, np.ndarray]:
+    chunk_rows = {str(row["id"]): row for row in rows}
+    chunk_ids = list(chunk_rows)
+    found: dict[str, np.ndarray] = {}
+    conn = db()
+    try:
+        # Batches stay below common SQLite parameter limits for large collections.
+        for offset in range(0, len(chunk_ids), 500):
+            batch = chunk_ids[offset:offset + 500]
+            if not batch:
+                continue
+            placeholders = ",".join("?" for _ in batch)
+            cached = conn.execute(
+                f"SELECT chunk_id, dimension, vector FROM chunk_embeddings "
+                f"WHERE model_name=? AND chunk_id IN ({placeholders})",
+                (model_name, *batch),
+            ).fetchall()
+            for item in cached:
+                vector = np.frombuffer(bytes(item["vector"]), dtype=np.float32).copy()
+                if vector.size != int(item["dimension"]) or vector.size == 0:
+                    continue
+                found[str(item["chunk_id"])] = vector
+    finally:
+        conn.close()
+
+    missing = [
+        {"id": chunk_id, "text": str(chunk_rows[chunk_id]["text"])}
+        for chunk_id in chunk_ids
+        if chunk_id not in found
+    ]
+    if missing:
+        index_dense_embeddings(missing)
+        conn = db()
+        try:
+            for offset in range(0, len(missing), 500):
+                batch = [item["id"] for item in missing[offset:offset + 500]]
+                placeholders = ",".join("?" for _ in batch)
+                cached = conn.execute(
+                    f"SELECT chunk_id, dimension, vector FROM chunk_embeddings "
+                    f"WHERE model_name=? AND chunk_id IN ({placeholders})",
+                    (model_name, *batch),
+                ).fetchall()
+                for item in cached:
+                    vector = np.frombuffer(bytes(item["vector"]), dtype=np.float32).copy()
+                    if vector.size == int(item["dimension"]) and vector.size > 0:
+                        found[str(item["chunk_id"])] = vector
+        finally:
+            conn.close()
+
+    missing_ids = set(chunk_ids) - set(found)
+    if missing_ids:
+        raise RuntimeError(
+            f"Dense index is missing {len(missing_ids)} chunks for model {model_name}"
+        )
+    return found
+
+
+def dense_similarity_scores(query: str, rows: list[Any]) -> list[float]:
+    """Return cosine similarity against cached dense embeddings, indexing misses on demand."""
+    if not rows:
+        return []
+    model_name = dense_retrieval.model_name()
+    stored = _stored_dense_vectors(rows, model_name)
+    query_vector = dense_retrieval.embed_query(query, name=model_name)
+    vectors = [stored[str(row["id"])] for row in rows]
+    return dense_retrieval.cosine_similarity_scores(query_vector, vectors)
+
+
+def _normalized_scores(values: list[float]) -> list[float]:
+    maximum = max(values) if values else 0.0
+    return [value / maximum if maximum > 0 else 0.0 for value in values]
+
+
+def _positive_rank_map(scores: list[float], rows: list[Any]) -> dict[int, int]:
+    ranked = [
+        index for index, score in enumerate(scores)
+        if math.isfinite(float(score)) and float(score) > 0
+    ]
+    ranked.sort(key=lambda index: (-float(scores[index]), str(rows[index]["id"])))
+    return {index: rank for rank, index in enumerate(ranked, start=1)}
+
+
 def hybrid_retrieve(
     query: str,
-    rows: list[sqlite3.Row],
+    rows: list[Any],
     k: int,
     diversify_documents: bool = False,
 ) -> list[dict[str, Any]]:
-    """Rank chunks with BM25 + TF-IDF, optionally reserving candidates per relevant source."""
-    if not rows:
+    """Fuse sparse wording retrieval (BM25/TF-IDF) with dense semantic retrieval using weighted RRF."""
+    if not rows or k <= 0:
         return []
-    texts = [row["text"] for row in rows]
+
+    texts = [str(row["text"]) for row in rows]
     search_query = correct_query_terms(query, texts)
-    lexical = bm25_scores(search_query, texts)
+    bm25_raw = bm25_scores(search_query, texts)
+
+    # TF-IDF keeps both unigrams and bigrams to capture exact terms and short phrases.
     vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), min_df=1)
-    matrix = vectorizer.fit_transform(texts)
-    tfidf = cosine_similarity(vectorizer.transform([search_query]), matrix)[0].tolist()
+    tfidf_matrix = vectorizer.fit_transform(texts)
+    tfidf_raw = cosine_similarity(vectorizer.transform([search_query]), tfidf_matrix)[0].tolist()
 
-    def normalize(values: list[float]) -> list[float]:
-        maximum = max(values) if values else 0.0
-        return [value / maximum if maximum else 0.0 for value in values]
+    # Dense retrieval is a separate semantic signal. Passage vectors are cached in SQLite;
+    # the ONNX embedder is loaded lazily and query vectors are normalized with cosine similarity.
+    dense_raw = dense_similarity_scores(search_query, rows)
 
-    lexical_norm, tfidf_norm = normalize(lexical), normalize(tfidf)
-    ranked = [(0.55 * b + 0.45 * t, row, b, t) for row, b, t in zip(rows, lexical_norm, tfidf_norm)]
-    ranked.sort(key=lambda item: (-item[0], item[1]["id"]))
+    bm25_ranks = _positive_rank_map(bm25_raw, rows)
+    tfidf_ranks = _positive_rank_map(tfidf_raw, rows)
+    dense_ranks = _positive_rank_map(dense_raw, rows)
+
+    weights = {
+        "bm25": max(0.0, float(os.getenv("HYBRID_BM25_WEIGHT", "0.35"))),
+        "tfidf": max(0.0, float(os.getenv("HYBRID_TFIDF_WEIGHT", "0.15"))),
+        "dense": max(0.0, float(os.getenv("HYBRID_DENSE_WEIGHT", "0.50"))),
+    }
+    weight_total = sum(weights.values())
+    if weight_total <= 0:
+        raise ValueError("At least one hybrid retrieval weight must be greater than zero")
+    weights = {name: weight / weight_total for name, weight in weights.items()}
+    rrf_k = max(1, int(os.getenv("HYBRID_RRF_K", "60")))
+
+    fused: dict[int, float] = {index: 0.0 for index in range(len(rows))}
+    for name, rank_map in (
+        ("bm25", bm25_ranks),
+        ("tfidf", tfidf_ranks),
+        ("dense", dense_ranks),
+    ):
+        weight = weights[name]
+        if weight <= 0:
+            continue
+        for index, rank in rank_map.items():
+            fused[index] += weight / (rrf_k + rank)
+
+    if not any(value > 0 for value in fused.values()):
+        return []
+
+    bm25_norm = _normalized_scores(bm25_raw)
+    tfidf_norm = _normalized_scores(tfidf_raw)
+    maximum_fused = max(fused.values())
+    ranked: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        if fused[index] <= 0:
+            continue
+        ranked.append({
+            "row": row,
+            "score": fused[index] / maximum_fused,
+            "rrf_score": fused[index],
+            "bm25": bm25_norm[index],
+            "tfidf": tfidf_norm[index],
+            "dense": float(dense_raw[index]),
+            "bm25_rank": bm25_ranks.get(index),
+            "tfidf_rank": tfidf_ranks.get(index),
+            "dense_rank": dense_ranks.get(index),
+        })
+    ranked.sort(key=lambda item: (
+        -item["rrf_score"],
+        -item["dense"],
+        -item["bm25"],
+        str(item["row"]["id"]),
+    ))
 
     selected = ranked[:k]
     if diversify_documents and k > 1:
         relevant_docs = relevant_document_ids(search_query, rows)
         if relevant_docs:
-            grouped: dict[str, list[tuple]] = {}
+            grouped: dict[str, list[dict[str, Any]]] = {}
             for entry in ranked:
-                document_id = str(entry[1]["document_id"])
-                if document_id in relevant_docs and query_term_match_score(search_query, entry[1]["text"]) > 0:
+                row = entry["row"]
+                document_id = str(row["document_id"])
+                if (
+                    document_id in relevant_docs
+                    and query_term_match_score(search_query, str(row["text"])) > 0
+                ):
                     grouped.setdefault(document_id, []).append(entry)
 
-            # Select the best topical passage per relevant document. A topic term
-            # in one page and a person name in another can establish document relevance.
             winners = []
             for document_id, entries in grouped.items():
                 best = max(
                     entries,
                     key=lambda entry: (
-                        query_term_match_score(search_query, entry[1]["text"]),
-                        entry[0],
+                        query_term_match_score(search_query, str(entry["row"]["text"])),
+                        entry["rrf_score"],
                     ),
                 )
                 winners.append(best)
-            winners.sort(
-                key=lambda entry: (
-                    -query_term_match_score(search_query, entry[1]["text"]),
-                    -entry[0],
-                    str(entry[1]["document_id"]),
-                )
-            )
+            winners.sort(key=lambda entry: (
+                -query_term_match_score(search_query, str(entry["row"]["text"])),
+                -entry["rrf_score"],
+                str(entry["row"]["document_id"]),
+            ))
 
             selected = []
             selected_ids: set[str] = set()
             for entry in winners:
                 if len(selected) >= k:
                     break
-                chunk_id = str(entry[1]["id"])
+                chunk_id = str(entry["row"]["id"])
                 selected.append(entry)
                 selected_ids.add(chunk_id)
-
-            # Fill only from documents that independently matched the full query.
             for entry in ranked:
                 if len(selected) >= k:
                     break
-                if str(entry[1]["document_id"]) not in relevant_docs:
+                if str(entry["row"]["document_id"]) not in relevant_docs:
                     continue
-                chunk_id = str(entry[1]["id"])
+                chunk_id = str(entry["row"]["id"])
                 if chunk_id not in selected_ids:
                     selected.append(entry)
                     selected_ids.add(chunk_id)
 
-
     return [
         {
-            "chunk_id": row["id"],
-            "document_id": row["document_id"],
-            "filename": row["filename"],
-            "page_start": row["page_start"],
-            "page_end": row["page_end"],
-            "score": round(score, 4),
-            "bm25": round(bm25, 4),
-            "tfidf": round(tf, 4),
-            "text": row["text"],
+            "chunk_id": str(item["row"]["id"]),
+            "document_id": str(item["row"]["document_id"]),
+            "filename": str(item["row"]["filename"]),
+            "page_start": int(item["row"]["page_start"]),
+            "page_end": int(item["row"]["page_end"]),
+            "score": round(float(item["score"]), 6),
+            "rrf_score": round(float(item["rrf_score"]), 8),
+            "bm25": round(float(item["bm25"]), 4),
+            "tfidf": round(float(item["tfidf"]), 4),
+            "dense": round(float(item["dense"]), 4),
+            "bm25_rank": item["bm25_rank"],
+            "tfidf_rank": item["tfidf_rank"],
+            "dense_rank": item["dense_rank"],
+            "text": str(item["row"]["text"]),
         }
-        for score, row, bm25, tf in selected
+        for item in selected
     ]
 
 

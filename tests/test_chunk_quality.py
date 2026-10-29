@@ -135,3 +135,66 @@ def test_misspelled_topic_selects_achievement_chunk_not_name_footer() -> None:
     assert candidates
     assert {item["document_id"] for item in candidates} == {"resume"}
     assert candidates[0]["chunk_id"] == "resume-achievements"
+
+
+def test_qualification_query_expands_to_terms_present_in_resume() -> None:
+    question = "What is the qualification of Gourav?"
+    corpus = [
+        "Gourav Kumar is an M.Tech candidate in Computer Science and Engineering at NIT Silchar. CGPA 8.12/10. Qualified GATE in 2024 and 2025.",
+        "The seminar explains transformer attention-head pruning and fidelity measurement.",
+    ]
+
+    expanded = core.expand_profile_query(question, corpus)
+
+    assert core.profile_query_intent(question) == "qualification"
+    assert "gourav" in expanded.casefold()
+    assert "gate" in expanded.casefold()
+    assert "cgpa" in expanded.casefold()
+    assert "tech" in expanded.casefold()
+
+
+def test_qualification_lookup_ignores_same_name_in_unrelated_seminar() -> None:
+    question = "What is the qualification of Gourav?"
+    corpus = [
+        "Gourav Kumar is an M.Tech candidate in Computer Science and Engineering at NIT Silchar. CGPA 8.12/10. Qualified GATE in 2024 and 2025.",
+        "Gourav presents a seminar about transformer attention-head pruning, fidelity, and quantum-inspired methods.",
+    ]
+    expanded = core.expand_profile_query(question, corpus)
+    rows = [
+        {
+            "id": "resume-education",
+            "document_id": "resume",
+            "filename": "Gourav_M.tech_CSE(AI).pdf",
+            "page_start": 1,
+            "page_end": 1,
+            "text": corpus[0],
+        },
+        {
+            "id": "seminar-method",
+            "document_id": "seminar",
+            "filename": "QFC_Seminar.pdf",
+            "page_start": 3,
+            "page_end": 3,
+            "text": corpus[1],
+        },
+    ]
+
+    relevant = core.relevant_document_ids(expanded, rows)
+    candidates = core.hybrid_retrieve(expanded, rows, 5, diversify_documents=True)
+
+    assert relevant == {"resume"}
+    assert candidates
+    assert {item["document_id"] for item in candidates} == {"resume"}
+    assert candidates[0]["chunk_id"] == "resume-education"
+    assert core.has_sufficient_evidence(expanded, candidates[:3])
+
+
+def test_qualification_intent_does_not_expand_if_no_alias_exists_in_corpus() -> None:
+    question = "What is the qualification of Gourav?"
+    expanded = core.expand_profile_query(
+        question,
+        ["Gourav presented a seminar on attention-head fidelity pruning."],
+    )
+
+    assert expanded == question
+    assert core.profile_query_intent(question) == "qualification"

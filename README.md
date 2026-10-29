@@ -42,6 +42,7 @@ The corpus is **not hard-coded**. Users upload PDFs through the web UI or `POST 
 - Page-local overlapping chunks; a chunk and its citation never span multiple PDF pages.
 - Remove short repeated PDF headers/footers, including page-number variants, before chunking.
 - Corpus-aware single-character typo correction for retrieval queries (for example, "achivements" → "achievements").
+- Profile-attribute query expansion for qualifications, achievements, skills, experience, and projects, using only vocabulary actually present in the indexed corpus and keeping person-name matches separate from topic relevance.
 - Hybrid BM25 + TF-IDF bigram retrieval with document-level relevance checks and topic-weighted source diversity.
 - Dedicated summary and method-explanation intents: broad requests (for example, “summarize both PDFs” or “explain the main method described in these documents”) sample representative page-local passages from each selected PDF instead of lexical-searching generic prompt words.
 - Task-specific prompts produce a per-document summary or explain the problem, steps, method, and stated limitations without inventing a method for a source that does not describe one.

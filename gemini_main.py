@@ -562,14 +562,17 @@ async def ask_stream(body: StreamAskRequest):
             rows = core.load_chunks(document_ids=scope) if scope else core.load_chunks()
             scoped_document_ids = sorted({str(row["document_id"]) for row in rows})
             multi_document = len(scoped_document_ids) > 1
-            search_question = core.correct_query_terms(
-                body.question, [str(row["text"]) for row in rows]
-            )
-            correction_note = (
-                f" · spelling normalized for retrieval: {search_question}"
-                if search_question.casefold() != body.question.casefold()
-                else ""
-            )
+            corpus_texts = [str(row["text"]) for row in rows]
+            corrected_question = core.correct_query_terms(body.question, corpus_texts)
+            search_question = core.expand_profile_query(corrected_question, corpus_texts)
+            normalization_notes = []
+            if corrected_question.casefold() != body.question.casefold():
+                normalization_notes.append(f"spelling normalized: {corrected_question}")
+            if search_question.casefold() != corrected_question.casefold():
+                intent = core.profile_query_intent(corrected_question)
+                if intent:
+                    normalization_notes.append(f"{intent} topic expansion enabled")
+            correction_note = (" · " + " · ".join(normalization_notes)) if normalization_notes else ""
             summary_request = is_summary_request(body.question)
             method_request = is_method_explanation_request(body.question)
             overview_request = summary_request or method_request

@@ -107,10 +107,23 @@ def evidence_groups(results: list[dict]) -> list[dict]:
 
 
 def candidate_matches_question(question: str, item: dict) -> bool:
-    """Check that a passage contains at least one query concept."""
+    """Accept lexical matches or strong semantic matches for multi-concept questions."""
+    if float(item.get("score", 0.0)) <= 0:
+        return False
+    if core.query_term_match_score(question, str(item.get("text", ""))) > 0:
+        return True
+    # For profile queries, require the topic expansion to supply a matching
+    # attribute signal; do not let a shared person name alone pass.
+    if core.profile_query_intent(question) is not None:
+        return False
+    query_terms = set(core.content_tokens(question))
     return (
-        float(item.get("score", 0.0)) > 0
-        and core.query_term_match_score(question, str(item.get("text", ""))) > 0
+        len(query_terms) >= 2
+        and float(item.get("dense", 0.0)) >= float(
+            os.getenv("DENSE_SOURCE_RELEVANCE_THRESHOLD", "0.38")
+        )
+        and item.get("dense_rank") is not None
+        and int(item["dense_rank"]) <= 10
     )
 
 
@@ -123,6 +136,14 @@ def diversify_reranked_results(
     """Select topic-relevant passages from documents matching the query as a whole."""
     source_rows = all_rows if all_rows is not None else ranked_results
     relevant_docs = core.relevant_document_ids(question, source_rows)
+    semantic_docs = {
+        str(item.get("document_id") or item.get("filename", ""))
+        for item in ranked_results
+        if candidate_matches_question(question, item)
+        and core.query_term_match_score(question, str(item.get("text", ""))) == 0
+    }
+    if core.profile_query_intent(question) is None:
+        relevant_docs.update(semantic_docs)
     if not relevant_docs:
         return []
 

@@ -237,6 +237,35 @@ def reprocess(document_id: str) -> dict[str, Any]:
     return {"document_id": document_id, "pages": len(pages), "chunks": len(chunks), "version": new_version}
 
 
+@app.post("/api/documents/reprocess-all")
+def reprocess_all() -> dict[str, Any]:
+    """Rebuild chunks for all stored PDFs after a chunking/relevance update."""
+    conn = core.db()
+    document_ids = [
+        str(row["id"])
+        for row in conn.execute("SELECT id FROM documents ORDER BY created_at").fetchall()
+    ]
+    conn.close()
+
+    results = []
+    for document_id in document_ids:
+        try:
+            results.append({"status": "ok", **reprocess(document_id)})
+        except HTTPException as exc:
+            results.append({
+                "status": "error",
+                "document_id": document_id,
+                "error": exc.detail,
+            })
+
+    return {
+        "total": len(document_ids),
+        "reprocessed": sum(1 for item in results if item["status"] == "ok"),
+        "failed": sum(1 for item in results if item["status"] == "error"),
+        "documents": results,
+    }
+
+
 @app.delete("/api/documents/{document_id}")
 def delete_document(document_id: str) -> dict[str, Any]:
     conn = core.db()

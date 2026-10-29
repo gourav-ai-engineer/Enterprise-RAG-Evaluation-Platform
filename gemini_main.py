@@ -190,6 +190,21 @@ def is_summary_request(question: str) -> bool:
     return bool(SUMMARY_INTENT_RE.search(question))
 
 
+METHOD_INTENT_RE = re.compile(
+    r"\\b(?:explain|describe|discuss|outline)\\b.{0,100}"
+    r"\\b(?:main|primary|proposed|key)?\\s*"
+    r"(?:method(?:ology)?|approach|technique|framework|process|algorithm)\\b"
+    r"|\\b(?:main|primary|proposed|key)\\s+"
+    r"(?:method(?:ology)?|approach|technique|framework|process|algorithm)\\b",
+    re.IGNORECASE,
+)
+
+
+def is_method_explanation_request(question: str) -> bool:
+    """Recognize requests to explain a document's method even without topic keywords."""
+    return bool(METHOD_INTENT_RE.search(question))
+
+
 def select_summary_evidence(
     rows: list,
     max_total_chunks: int = 32,
@@ -262,6 +277,20 @@ def build_prompt(question: str, results: list[dict]) -> tuple[str, str]:
             "Aim for a clear, useful summary under 250 words total. "
             "For mathematical notation, use readable Unicode/plain text and never raw LaTeX."
         )
+    elif is_method_explanation_request(question):
+        system = (
+            "You are the final answer layer of a grounded enterprise RAG system. "
+            "The user asks about the method or approach described in selected documents. "
+            "Explain the method for each supplied source separately, if it contains one. "
+            "For each source, identify the problem or goal, the main steps or components, "
+            "how the method works, and any stated results or limitations. Use concise bullets "
+            "or a short structured explanation, with citations such as [Source N] on each claim. "
+            "Do not confuse a document's subject/background with its proposed method. "
+            "If a source does not describe a method in the supplied passages, say that the "
+            "available passages do not describe one rather than inventing a method. "
+            "Use only the supplied evidence and do not imply unseen pages were inspected. "
+            "Return only the explanation, normally under 250 words total, and never raw LaTeX."
+        )
     else:
         system = (
             "You are the final answer layer of a grounded enterprise RAG system. "
@@ -331,7 +360,7 @@ async def gemini_stream_generate(
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": [{"role": "user", "parts": [{"text": user}]}],
         "generationConfig": {
-            "maxOutputTokens": 480 if is_summary_request(question) else 160,
+            "maxOutputTokens": 480 if (is_summary_request(question) or is_method_explanation_request(question)) else 160,
             # Simple factual RAG questions do not need deep reasoning.
             "thinkingConfig": {
                 "thinkingLevel": "minimal" if model in {
@@ -542,15 +571,17 @@ async def ask_stream(body: StreamAskRequest):
                 else ""
             )
             summary_request = is_summary_request(body.question)
+            method_request = is_method_explanation_request(body.question)
+            overview_request = summary_request or method_request
             t = time.perf_counter()
-            if summary_request:
+            if overview_request:
                 results = select_summary_evidence(rows)
                 candidates = list(results)
                 retrieval_ms = (time.perf_counter() - t) * 1000
                 answerable = bool(results)
                 yield sse("stage", {
                     "id": "retrieval",
-                    "label": "Document summary retrieval",
+                    "label": "Document summary retrieval" if summary_request else "Method explanation retrieval",
                     "detail": (
                         f"Selected {len(results)} representative passages across "
                         f"{len({item['document_id'] for item in results})} selected documents"
@@ -560,7 +591,7 @@ async def ask_stream(body: StreamAskRequest):
                 rerank_ms = 0.0
                 yield sse("stage", {
                     "id": "rerank",
-                    "label": "Preparing summary context",
+                    "label": "Preparing summary context" if summary_request else "Preparing method explanation context",
                     "detail": "Balanced page coverage across selected documents",
                     "done": True,
                 })

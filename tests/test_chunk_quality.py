@@ -18,9 +18,13 @@ def test_chunks_never_cross_page_boundaries() -> None:
 
 
 def test_repeated_slides_footer_is_removed_before_chunking() -> None:
+    topic_words = [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf",
+        "hotel", "india", "juliet", "kilo", "lima", "mike", "november",
+    ]
     pages = [
-        f"Unique body content for slide {page_no}.\nGourav — 2522105 — NIT Silchar {page_no} / 14"
-        for page_no in range(1, 15)
+        f"Unique body content about topic {topic}.\nGourav — 2522105 — NIT Silchar {page_no} / 14"
+        for page_no, topic in enumerate(topic_words, 1)
     ]
 
     chunks = core.chunk_pages(pages)

@@ -112,6 +112,77 @@ def correct_query_terms(query: str, corpus_texts: list[str]) -> str:
     return corrected
 
 
+PROFILE_QUERY_ALIASES = {
+    "qualification": [
+        "education", "degree", "academic", "qualified", "gate", "cgpa",
+        "tech", "master", "bachelor", "university", "institute",
+        "college", "engineering", "computer", "science",
+    ],
+    "achievements": [
+        "achievements", "achievement", "qualified", "gate", "cgpa",
+        "certification", "certifications", "leetcode", "award", "awards",
+        "publication", "publications", "competition", "hackathon",
+        "project", "projects", "built", "developed",
+    ],
+    "skills": [
+        "skills", "skill", "python", "pytorch", "tensorflow", "opencv",
+        "machine", "learning", "deep", "llm", "fastapi", "docker", "sql",
+        "qdrant", "langgraph", "transformer", "computer", "vision",
+    ],
+    "experience": [
+        "experience", "work", "internship", "intern", "research",
+        "teaching", "assistant", "engineer", "developed", "built",
+        "project", "projects", "role", "employment",
+    ],
+    "projects": [
+        "project", "projects", "built", "developed", "implemented",
+        "system", "pipeline", "retrieval", "api", "model", "application",
+    ],
+}
+PROFILE_INTENT_PATTERNS = [
+    ("qualification", re.compile(r"\b(?:qualif\w*|education|degree|academic|graduat\w*|college|university)\b", re.I)),
+    ("achievements", re.compile(r"\b(?:achiev\w*|accomplish\w*|certif\w*|awards?|honou?rs?|accolades?)\b", re.I)),
+    ("skills", re.compile(r"\b(?:skills?|proficienc\w*|tech(?:nical)? stack|technologies)\b", re.I)),
+    ("experience", re.compile(r"\b(?:experience|employment|internships?|work history|worked at)\b", re.I)),
+    ("projects", re.compile(r"\b(?:projects?|what did .* build|what .* developed)\b", re.I)),
+]
+_PROFILE_NON_ENTITY_TERMS = {
+    "what", "who", "when", "where", "which", "how", "many", "much",
+    "is", "are", "was", "were", "did", "does", "do", "the", "a", "an",
+    "of", "for", "in", "on", "at", "to", "and", "or", "tell", "show",
+    "give", "list", "explain", "describe", "summarize", "summarise",
+    "both", "these", "those", "document", "documents", "pdf", "pdfs",
+}
+
+
+def profile_query_intent(question: str) -> str | None:
+    """Return the profile attribute being asked about, if any."""
+    for intent, pattern in PROFILE_INTENT_PATTERNS:
+        if pattern.search(question):
+            return intent
+    return None
+
+
+def expand_profile_query(question: str, corpus_texts: list[str]) -> str:
+    """Expand profile attributes with evidence vocabulary found in the indexed PDFs."""
+    intent = profile_query_intent(question)
+    if intent is None:
+        return question
+
+    vocabulary = set(content_tokens(" ".join(corpus_texts)))
+    original_terms = set(content_tokens(question))
+    aliases = [
+        term for term in PROFILE_QUERY_ALIASES[intent]
+        if term in vocabulary and term not in original_terms
+    ]
+    # Keep the expansion narrow and put topic terms first, so they rank above the
+    # person's name. This prevents a repeated name/footer from dominating ranking.
+    aliases = list(dict.fromkeys(aliases))[:8]
+    if not aliases:
+        return question
+    return " ".join(aliases + [question])
+
+
 def minimum_query_overlap(question: str) -> int:
     """Require more than a shared name for a multi-concept query."""
     count = len(set(content_tokens(question)))
@@ -134,7 +205,7 @@ def query_term_match_score(question: str, text: str) -> int:
 
 
 def relevant_document_ids(question: str, rows: list[Any]) -> set[str]:
-    """Determine relevance across a document's chunks, not one chunk in isolation."""
+    """Determine relevance per document, using attribute-specific checks for profile questions."""
     terms = set(content_tokens(question))
     if not terms:
         return set()
@@ -144,6 +215,29 @@ def relevant_document_ids(question: str, rows: list[Any]) -> set[str]:
         document_terms.setdefault(document_id, set()).update(
             content_tokens(str(row["text"]))
         )
+
+    intent = profile_query_intent(question)
+    if intent:
+        alias_terms = set(PROFILE_QUERY_ALIASES[intent])
+        entity_terms = terms - alias_terms - _PROFILE_NON_ENTITY_TERMS
+        strong_signals = {
+            "qualification": {"education", "degree", "academic", "qualified", "gate", "cgpa", "tech", "master", "bachelor", "university", "institute", "college"},
+            "achievements": {"achievements", "achievement", "qualified", "gate", "cgpa", "certification", "certifications", "leetcode", "award", "awards", "publication", "publications", "competition", "hackathon"},
+            "skills": {"skills", "skill", "python", "pytorch", "tensorflow", "opencv", "learning", "llm", "fastapi", "docker", "sql", "qdrant", "langgraph"},
+            "experience": {"experience", "internship", "intern", "research", "teaching", "assistant", "employment"},
+            "projects": {"project", "projects", "built", "developed", "implemented", "pipeline", "retrieval", "application"},
+        }[intent]
+        broad_signals = set(PROFILE_QUERY_ALIASES[intent]) - strong_signals
+        relevant = set()
+        for document_id, evidence_terms in document_terms.items():
+            if entity_terms and not (entity_terms & evidence_terms):
+                continue
+            specific_hits = strong_signals & evidence_terms
+            broad_hits = broad_signals & evidence_terms
+            if specific_hits or len(broad_hits) >= 2:
+                relevant.add(document_id)
+        return relevant
+
     required = minimum_query_overlap(question)
     return {
         document_id

@@ -29,6 +29,7 @@ TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "25"))
 CHUNK_WORDS = int(os.getenv("CHUNK_WORDS", "180"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "40"))
+CHUNKER_VERSION = "page-local-v2"
 RETRIEVAL_CANDIDATES = int(os.getenv("RETRIEVAL_CANDIDATES", "20"))
 RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "5"))
 STOPWORDS = set("a an and are as at be been but by can could did do does for from how i if in into is it its me of on or our please should that the their them there these this to was were what when where which who why with would you your".split())

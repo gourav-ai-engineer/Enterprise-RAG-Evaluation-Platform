@@ -651,9 +651,17 @@ def hybrid_retrieve(
     ]
 
 
-def rerank_score(question: str, text: str, retrieval_score: float, rank: int) -> float:
+def rerank_score(
+    question: str,
+    text: str,
+    retrieval_score: float,
+    rank: int,
+    dense_score: float = 0.0,
+) -> float:
     q = set(content_tokens(question)); t = set(content_tokens(text)); overlap = len(q & t); coverage = overlap / max(1, len(q))
-    lower = text.lower(); score = retrieval_score * 4.0 + coverage * 8.0 + min(overlap, 6) * 0.7
+    lower = text.lower()
+    # Semantic similarity helps a paraphrase survive when exact word overlap is low.
+    score = retrieval_score * 4.0 + max(0.0, dense_score) * 4.0 + coverage * 8.0 + min(overlap, 6) * 0.7
     if re.search(r"\b(is|are|refers to|denotes|defined as|means|we present|we propose|combines|combining|consists of)\b", lower): score += 2.5
     if re.search(r"\b(how|why|method|approach|architecture|algorithm|objective|purpose|designed|used)\b", question.lower()) and re.search(r"\b(method|approach|architecture|algorithm|objective|purpose|designed|used|proposed)\b", lower): score += 1.5
     if len(text.split()) < 12: score -= 1.5
@@ -669,7 +677,13 @@ def rerank(question: str, candidates: list[dict[str, Any]], k: int) -> list[dict
     search_question = correct_query_terms(question, corpus_texts)
     for rank, item in enumerate(candidates):
         x = dict(item)
-        x["rerank_score"] = round(rerank_score(search_question, x["text"], x["score"], rank), 4)
+        x["rerank_score"] = round(
+            rerank_score(
+                search_question, x["text"], x["score"], rank,
+                float(x.get("dense", 0.0)),
+            ),
+            4,
+        )
         ranked.append(x)
     ranked.sort(key=lambda x: (-x["rerank_score"], -x["score"], x["chunk_id"]))
     return ranked[:k]
@@ -692,7 +706,22 @@ def has_sufficient_evidence(question: str, results: list[dict[str, Any]]) -> boo
     normalized_question = correct_query_terms(question, corpus_texts)
     q = set(content_tokens(normalized_question))
     context = set(content_tokens(" ".join(corpus_texts)))
-    return bool(q and len(q & context) >= minimum_query_overlap(normalized_question))
+    lexical_overlap = len(q & context) if q else 0
+    if q and lexical_overlap >= minimum_query_overlap(normalized_question):
+        return True
+
+    # Allow semantically strong evidence for paraphrased questions, but not for
+    # one-word/name-only queries. This threshold is configurable and should be
+    # calibrated on an answerable/unanswerable evaluation set.
+    semantic_threshold = float(os.getenv("DENSE_ANSWERABILITY_THRESHOLD", "0.42"))
+    if len(q) >= 2:
+        best_semantic = max(
+            (float(result.get("dense", 0.0)) for result in results),
+            default=0.0,
+        )
+        if best_semantic >= semantic_threshold:
+            return True
+    return False
 
 
 def extractive_answer(question: str, results: list[dict[str, Any]]) -> str:

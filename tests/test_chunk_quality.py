@@ -196,5 +196,5 @@ def test_qualification_intent_does_not_expand_if_no_alias_exists_in_corpus() -> 
         ["Gourav presented a seminar on attention-head fidelity pruning."],
     )
 
-    assert "gourav" in expanded.casefold()
+    assert expanded == question
     assert core.profile_query_intent(question) == "qualification"

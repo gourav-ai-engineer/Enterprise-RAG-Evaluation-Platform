@@ -520,8 +520,17 @@ def hybrid_retrieve(
 
     # TF-IDF keeps both unigrams and bigrams to capture exact terms and short phrases.
     vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), min_df=1)
-    tfidf_matrix = vectorizer.fit_transform(texts)
-    tfidf_raw = cosine_similarity(vectorizer.transform([search_query]), tfidf_matrix)[0].tolist()
+    try:
+        tfidf_matrix = vectorizer.fit_transform(texts)
+        tfidf_raw = cosine_similarity(
+            vectorizer.transform([search_query]), tfidf_matrix
+        )[0].tolist()
+    except ValueError as exc:
+        # A corpus made only of stop words has no TF-IDF vocabulary. Keep the
+        # other retrievers available instead of failing the entire query.
+        if "empty vocabulary" not in str(exc).lower() and "no terms remain" not in str(exc).lower():
+            raise
+        tfidf_raw = [0.0] * len(rows)
 
     # Dense retrieval is a separate semantic signal. Passage vectors are cached in SQLite;
     # the ONNX embedder is loaded lazily and query vectors are normalized with cosine similarity.

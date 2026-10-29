@@ -114,7 +114,7 @@ def correct_query_terms(query: str, corpus_texts: list[str]) -> str:
 
 PROFILE_QUERY_ALIASES = {
     "qualification": [
-        "education", "degree", "academic", "qualified", "gate", "cgpa",
+        "qualification", "qualifications", "education", "degree", "academic", "qualified", "gate", "cgpa",
         "tech", "master", "bachelor", "university", "institute",
         "college", "engineering", "computer", "science",
     ],
@@ -221,7 +221,7 @@ def relevant_document_ids(question: str, rows: list[Any]) -> set[str]:
         alias_terms = set(PROFILE_QUERY_ALIASES[intent])
         entity_terms = terms - alias_terms - _PROFILE_NON_ENTITY_TERMS
         strong_signals = {
-            "qualification": {"education", "degree", "academic", "qualified", "gate", "cgpa", "tech", "master", "bachelor", "university", "institute", "college"},
+            "qualification": {"qualification", "qualifications", "education", "degree", "academic", "qualified", "gate", "cgpa", "tech", "master", "bachelor", "university", "institute", "college"},
             "achievements": {"achievements", "achievement", "qualified", "gate", "cgpa", "certification", "certifications", "leetcode", "award", "awards", "publication", "publications", "competition", "hackathon"},
             "skills": {"skills", "skill", "python", "pytorch", "tensorflow", "opencv", "learning", "llm", "fastapi", "docker", "sql", "qdrant", "langgraph"},
             "experience": {"experience", "internship", "intern", "research", "teaching", "assistant", "employment"},

@@ -226,7 +226,7 @@ def test_method_explanation_uses_representative_evidence_and_calls_gemini(monkey
         return "".join(blocks)
 
     stream = asyncio.run(call_endpoint())
-    result_block = next(block for block in stream.split("\\n\\n") if block.startswith("event: result"))
+    result_block = next(block for block in stream.split("\n\n") if block.startswith("event: result"))
     result = json.loads(result_block.split("data: ", 1)[1])
 
     assert len(generated) == 1

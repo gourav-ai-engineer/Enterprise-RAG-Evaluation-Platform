@@ -39,10 +39,13 @@ The corpus is **not hard-coded**. Users upload PDFs through the web UI or `POST 
 - Retrieval cache is scoped by query, chunk set and top-k so document scope cannot leak across requests.
 
 ### Retrieval and generation
-- Hybrid BM25 + TF-IDF bigram retrieval.
+- Page-local overlapping chunks; a chunk and its citation never span multiple PDF pages.
+- Remove short repeated PDF headers/footers, including page-number variants, before chunking.
+- Corpus-aware single-character typo correction for retrieval queries (for example, "achivements" → "achievements").
+- Hybrid BM25 + TF-IDF bigram retrieval with document-level relevance checks and topic-weighted source diversity.
 - Candidate expansion followed by intent-aware reranking.
 - Definition/method/purpose signals and table/numeric noise suppression.
-- Evidence/answerability gate with safe abstention.
+- Stricter evidence/answerability gate so a shared person name alone cannot support an unrelated topic.
 - Gemini streaming generation with strict evidence-only prompting and source IDs. All evidence-supported questions use the language-model generation path; there is no local extractive-answer substitute.
 - Optional Ollama/OpenAI-compatible workflow remains available through the underlying application modules.
 - Grouped document/page citations and exact evidence inspection.
@@ -50,7 +53,7 @@ The corpus is **not hard-coded**. Users upload PDFs through the web UI or `POST 
 ### Knowledge operations
 - Collections with unique names and document assignment.
 - Document detail endpoint with status, source type, version, update metadata and quality signal.
-- Reprocess/delete lifecycle actions.
+- Reprocess/delete lifecycle actions, including `POST /api/documents/reprocess-all` to rebuild existing PDFs after chunking updates.
 - Stored-file existence diagnostics.
 
 ### Evaluation-driven operations
